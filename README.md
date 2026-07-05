@@ -1,3 +1,28 @@
+
+
+Giới thiệu OpenOPC – framework mã nguồn mở giúp bạn tự xây dựng một "công ty AI một người" cho riêng mình, dù bạn chỉ có... một mình! 
+
+
+
+🚀Link trong bình luận nhé!
+
+
+
+Với OpenOPC, một người vẫn có thể vận hành cả một "công ty" hoàn chỉnh, vì AI sẽ đóng vai trò như những nhân viên thực thụ, từ đó xoá nhoà giới hạn về số lượng người trong team.
+
+Các tính năng nổi bật của OpenOPC:
+
+🏗️ Tự Xây Dựng (Self-Built) OpenOPC tự động khởi tạo các "nhân viên AI" theo từng vai trò cụ thể, rồi tổ chức chúng thành một công ty có cấu trúc hoàn chỉnh, sẵn sàng nhận việc — không cần bạn phải setup thủ công gì cả! 🙌
+
+⚙️ Tự Vận Hành (Self-Run) Hệ thống tự điều phối sự phối hợp giữa nhiều AI agent một cách trơn tru: phân công nhiệm vụ rõ ràng, chuyển giao công việc thông minh, review chéo lẫn nhau, và chạy theo vòng lặp khép kín cho đến khi hoàn tất. 🔄
+
+🌱 Tự Phát Triển (Self-Grown) Mỗi lần thực thi nhiệm vụ đều được ghi lại thành kho tri thức tổ chức có thể tái sử dụng, giúp "công ty AI" của bạn không ngừng học hỏi, thích nghi và cải thiện theo thời gian. 📈
+
+👉 Nói ngắn gọn: bạn chỉ cần đứng ra làm "CEO", còn lại để OpenOPC lo phần xây dựng và vận hành cả một bộ máy nhân sự AI 
+
+
+
+
 <h1 align="center" style="font-size: 1.75em;">OpenOPC: Build Your Personal AI-Native Company — Self-Built, Self-Run, Self-Grown</h1>
 
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
