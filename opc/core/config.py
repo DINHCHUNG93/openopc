@@ -585,8 +585,9 @@ class StreamRenderingConfig(BaseModel):
 
 class ContextGuardConfig(BaseModel):
     enabled: bool = True
-    soft_threshold: float = 0.60
-    hard_threshold: float = 0.80
+    # Below this usage ratio the history is never rewritten; at or above it
+    # the runtime folds old messages into one LLM summary (durable compaction).
+    hard_threshold: float = 0.90
     warn_remaining_pct: int = 15
     tool_output_char_budget: int = 12_000
     shell_stdout_char_budget: int = 12_000
