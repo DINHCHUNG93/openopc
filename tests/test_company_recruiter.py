@@ -30,7 +30,15 @@ from opc.layer2_organization.talent_market import TalentMarket
 from opc.layer5_memory.memory_manager import MemoryManager
 from tests._temp_paths import WorkspaceTemporaryDirectory, workspace_path
 
-tempfile.TemporaryDirectory = WorkspaceTemporaryDirectory  # type: ignore[assignment]
+_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+
+
+def setUpModule() -> None:
+    tempfile.TemporaryDirectory = WorkspaceTemporaryDirectory  # type: ignore[assignment]
+
+
+def tearDownModule() -> None:
+    tempfile.TemporaryDirectory = _REAL_TEMPORARY_DIRECTORY  # type: ignore[assignment]
 
 
 class DummyRecruiterLLM:

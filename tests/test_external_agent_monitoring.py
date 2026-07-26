@@ -1506,7 +1506,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("## Skill: memory", worker_task.description)
             self.assertIn("## Skill: memory", final_task.description)
 
-    async def test_engine_stages_uploaded_attachments_for_external_resume_prompt(self) -> None:
+    async def test_engine_provisions_uploaded_attachments_for_external_resume_prompt(self) -> None:
         engine = OPCEngine()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2800,7 +2800,6 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
         task = Task(title="demo", description="demo")
         prompt = adapter.build_task_prompt(task)
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
 
         tmpdir = _make_test_dir("codex-no-pty-argv-prompt")
         try:
@@ -2809,6 +2808,12 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                     "opc.layer3_agent.adapters.codex_adapter.asyncio.create_subprocess_exec",
                     AsyncMock(return_value=proc),
                 ) as spawn_mock:
+                # Build inside the no-PTY patch: build_interactive_invocation
+                # records stdin_policy/interactive_input_channel in metadata,
+                # and on a real PTY-less host build and start observe the same
+                # platform capability. Building outside the patch would bake in
+                # this host's PTY support and contradict the patched start.
+                cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
                 started = await adapter.start_process(
                     cmd,
                     tmpdir,
