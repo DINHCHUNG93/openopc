@@ -45,6 +45,7 @@ from opc.layer2_organization.work_item_transition import (
     is_prunable_dependency_work_item,
     normalize_dependency_work_item_ids,
     refresh_dependents_for_run,
+    transition_work_item,
 )
 from opc.layer4_tools.output_budget import clip_text
 from opc.layer4_tools.registry import ToolDefinition
@@ -2689,33 +2690,32 @@ def create_collaboration_tools(
                         claimed_by_seat_id="",
                     )
                     if descendant.phase not in DONE_PHASES:
-                        await store.update_delegation_work_item(
+                        await transition_work_item(
+                            store,
                             descendant.work_item_id,
-                            phase=Phase.CANCELLED,
+                            target_phase=Phase.CANCELLED,
+                            reason=descendant_reason,
+                            release_claim=True,
                             blocked_reason=descendant_reason[:500],
                             handoff_status="cancelled",
-                            claimed_by_role_runtime_session_id="",
-                            claimed_by_seat_id="",
                         )
+                        # Task.status is projected from the phase by the
+                        # transition hooks; here we only stamp the task-owned
+                        # audit trail and release the execution lock.
+                        if callable(get_runtime_task):
+                            runtime_task = await get_runtime_task(descendant.work_item_id)
+                            if runtime_task is not None:
+                                runtime_task.execution_lock = False
+                                runtime_task.execution_locked_at = None
+                                runtime_task.metadata = {
+                                    **dict(runtime_task.metadata or {}),
+                                    "last_stop_reason": "manager_deleted_ancestor_work_item",
+                                    "deleted_by_manager_tool": True,
+                                    "cascade_deleted_by_work_item_id": item.work_item_id,
+                                }
+                                if hasattr(store, "save_task"):
+                                    await store.save_task(runtime_task)
                     cascade_deleted_ids.append(descendant.work_item_id)
-                    if callable(get_runtime_task):
-                        runtime_task = await get_runtime_task(descendant.work_item_id)
-                        if runtime_task is not None and runtime_task.status not in {
-                            TaskStatus.DONE,
-                            TaskStatus.FAILED,
-                            TaskStatus.CANCELLED,
-                        }:
-                            runtime_task.status = TaskStatus.CANCELLED
-                            runtime_task.execution_lock = False
-                            runtime_task.execution_locked_at = None
-                            runtime_task.metadata = {
-                                **dict(runtime_task.metadata or {}),
-                                "last_stop_reason": "manager_deleted_ancestor_work_item",
-                                "deleted_by_manager_tool": True,
-                                "cascade_deleted_by_work_item_id": item.work_item_id,
-                            }
-                            if hasattr(store, "save_task"):
-                                await store.save_task(runtime_task)
                 except Exception:
                     logger.opt(exception=True).warning(
                         "delete_work_item: failed to cascade delete descendant {}",

@@ -102,6 +102,8 @@ async def transition_work_item(
     metadata_updates: dict[str, Any] | None = None,
     release_claim: bool = False,
     attempt_outcome: str | None = None,
+    blocked_reason: str | None = None,
+    handoff_status: str | None = None,
 ) -> DelegationWorkItem | None:
     """Transition a work item to ``target_phase``.
 
@@ -124,6 +126,10 @@ async def transition_work_item(
         metadata_updates: Extra metadata keys to merge onto the work item.
         release_claim: When True, clears the current claim so the dispatcher
             can re-acquire. Useful for cancel / timeout / forced-release paths.
+        blocked_reason: Optional ``blocked_reason`` column value, folded into
+            the same write as the phase change (pass ``""`` to clear).
+        handoff_status: Optional ``handoff_status`` column value, folded into
+            the same write as the phase change.
 
     Returns:
         The updated ``DelegationWorkItem``, or ``None`` when the store lacks
@@ -166,6 +172,10 @@ async def transition_work_item(
     }
     if summary is not None:
         kwargs["summary"] = summary
+    if blocked_reason is not None:
+        kwargs["blocked_reason"] = blocked_reason
+    if handoff_status is not None:
+        kwargs["handoff_status"] = handoff_status
     if release_claim:
         # Fold claim release into the same write as the phase change: the
         # legacy two-call sequence could commit the phase and then fail the

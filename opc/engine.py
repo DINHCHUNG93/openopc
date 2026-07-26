@@ -103,6 +103,7 @@ from opc.layer2_organization.company_runtime_identity import (
     load_company_runtime_identity_index,
 )
 from opc.layer2_organization.metadata_ownership import (
+    build_company_resume_identity_restore,
     build_work_item_owner_execution_copy,
 )
 from opc.layer2_organization.phase import (
@@ -6253,13 +6254,13 @@ class OPCEngine:
             identity.get("selected_execution_agent_source", "") or ""
         ).strip()
 
-        metadata["work_item_role_id"] = identity["role_id"] or task_role_id
-        if identity["seat_id"]:
-            metadata["delegation_seat_id"] = identity["seat_id"]
-        if identity["role_runtime_session_id"]:
-            metadata["delegation_role_session_id"] = identity[
-                "role_runtime_session_id"
-            ]
+        metadata.update(
+            build_company_resume_identity_restore(
+                role_id=identity["role_id"] or task_role_id,
+                seat_id=identity["seat_id"],
+                role_runtime_session_id=identity["role_runtime_session_id"],
+            )
+        )
         if identity.get("explicit") or identity["employee_assignment"]:
             metadata["employee_assignment"] = copy.deepcopy(
                 identity["employee_assignment"]
