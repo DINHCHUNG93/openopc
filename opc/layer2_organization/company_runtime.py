@@ -29,6 +29,8 @@ from opc.layer2_organization.phase import (
     is_dispatchable,
     is_report_execution_work_item_metadata,
     is_review_execution_work_item_metadata,
+    is_runnable,
+    is_terminal,
 )
 from opc.layer2_organization.metadata_ownership import sync_work_item_current_turn_mode
 from opc.layer2_organization.session_scoping import (
@@ -1266,11 +1268,41 @@ class CompanyRuntime:
                 )
                 continue
             if session_status == "blocked" and not can_soft_wake:
-                _skip(
-                    "session.status=blocked and no review-soft-wake entry in queue",
-                    session=session_label,
-                )
-                continue
+                # Stale-block reconcile: `blocked` means "parked on my focused
+                # item until something external advances it". The park reason
+                # is gone when that item is runnable again (rework bounce /
+                # children-done wake), when it is TERMINAL (the awaited event
+                # already happened — observed shape: a review-preempt turn
+                # leaves the session parked on its own approved review card),
+                # or when there is no focus at all. Phase is the single
+                # source of truth, so converge the session instead of
+                # skipping forever.
+                focused_id = str(session.focused_work_item_id or "").strip()
+                focused_item = work_item_map.get(focused_id) if focused_id else None
+                focused_phase = getattr(focused_item, "phase", None)
+                if not focused_id or (
+                    focused_item is not None
+                    and (is_runnable(focused_phase) or is_terminal(focused_phase))
+                ):
+                    logger.info(
+                        "claim reconcile: stale blocked session converged to "
+                        "idle  session={} focused={} phase={}",
+                        session_label,
+                        focused_id or "<none>",
+                        getattr(focused_phase, "value", focused_phase),
+                    )
+                    session.current_task_id = ""
+                    session.focused_work_item_id = ""
+                    self._set_member_session_status(session, "idle")
+                    session_status = "idle"
+                else:
+                    _skip(
+                        "session.status=blocked and no review-soft-wake entry in queue",
+                        session=session_label,
+                        focused=focused_id or None,
+                        focused_phase=getattr(focused_phase, "value", None),
+                    )
+                    continue
             role_session = self._role_session_for_member_session(session)
             role_session_status = ""
             if role_session is not None:
