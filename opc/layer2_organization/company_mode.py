@@ -5461,21 +5461,51 @@ class CompanyWorkItemExecutor:
 
     @staticmethod
     def _parse_self_evolution_patch_json(raw: str | None) -> dict[str, Any] | None:
+        """Extract the ``{"patches": [...]}`` object from a turn's final text.
+
+        Native runtime turns rarely end with bare JSON: the model narrates
+        around it, wraps it in a markdown fence, or the runtime appends a
+        verification status line after it. Any of those killed the old
+        strict ``json.loads`` — so scan fenced blocks and every balanced
+        JSON object in the text, preferring the first one that carries a
+        ``patches`` key.
+        """
         text = str(raw or "").strip()
         if not text:
             return None
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            if text.lower().startswith("json\n"):
-                text = text.split("\n", 1)[1].strip()
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+        decoder = json.JSONDecoder()
+
+        def _scan(candidate: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            with_patches: dict[str, Any] | None = None
+            bare: dict[str, Any] | None = None
+            for match in re.finditer(r"\{", candidate):
+                try:
+                    value, _ = decoder.raw_decode(candidate, match.start())
+                except Exception:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                if "patches" in value:
+                    return value, bare
+                if bare is None:
+                    bare = value
+            return with_patches, bare
+
+        candidates = [
+            fence.group(1)
+            for fence in re.finditer(
+                r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE
+            )
+        ]
+        candidates.append(text)
+        first_bare: dict[str, Any] | None = None
+        for candidate in candidates:
+            found, bare = _scan(candidate)
+            if found is not None:
+                return found
+            if first_bare is None and bare is not None:
+                first_bare = bare
+        return first_bare
 
     @staticmethod
     def _self_evolution_patch_validation_error(patches: list[Any], employee_id: str) -> str:
@@ -5531,15 +5561,19 @@ class CompanyWorkItemExecutor:
                 "self_evolution_error": error_record,
                 "self_evolution_recorded": [],
             })
+        # Self-evolution is an opt-in reflection pass over an already
+        # delivered run. Settling as CANCELLED (not FAILED) keeps the
+        # abandoned reflection from polluting the delivered run's terminal
+        # verdict; the error record above preserves the diagnosis.
         await transition_work_item_from_task(
             self.store,
             task,
-            target_status_or_phase=Phase.FAILED,
-            reason="invalid_self_evolution_json",
+            target_status_or_phase=Phase.CANCELLED,
+            reason="self_evolution_abandoned",
             summary=feedback,
         )
         await self.save_task(task)
-        return TaskResult(status=TaskStatus.FAILED, content=feedback, artifacts={"self_evolution_error": error_record})
+        return TaskResult(status=TaskStatus.CANCELLED, content=feedback, artifacts={"self_evolution_error": error_record})
 
     async def _finalize_self_evolution_work_item(
         self,
@@ -5547,14 +5581,30 @@ class CompanyWorkItemExecutor:
         result: TaskResult,
     ) -> TaskResult | None:
         content = str(result.content or "").strip()
-        data = self._parse_self_evolution_patch_json(content)
+        # The tool submission is the authoritative channel: patches recorded
+        # via `submit_self_evolution_patches` survive whatever shape the
+        # final narration takes. Text parsing is the fallback only.
+        submitted = dict((task.metadata or {}).get("self_evolution_submitted_patch", {}) or {})
+        if isinstance(submitted.get("patches"), list):
+            data: dict[str, Any] | None = {"patches": list(submitted.get("patches") or [])}
+        else:
+            data = self._parse_self_evolution_patch_json(content)
         patches = data.get("patches") if isinstance(data, dict) else None
         retry_count = int((task.metadata or {}).get("self_evolution_patch_retry_count", 0) or 0)
         max_retries = int((task.metadata or {}).get("self_evolution_patch_max_retries", 3) or 3)
         if data is None or not isinstance(patches, list):
+            excerpt = content[:200].replace("\n", " ")
+            problem = (
+                "no JSON object with a top-level `patches` list was found in the final response"
+                if data is None
+                else "the JSON object found has no `patches` list"
+            )
             feedback = (
-                "Self-evolution output must be strict JSON with a top-level `patches` list. "
-                "Do not include prose, markdown, or delivery content."
+                "Self-evolution result was not machine-readable: "
+                f"{problem}. Received: `{excerpt}`. "
+                "Call the `submit_self_evolution_patches` tool with your `patches` list "
+                "(pass an empty list when no experience update is needed); the tool "
+                "records the patches regardless of your final text."
             )
             return await self._retry_or_fail_self_evolution_output(
                 task,
@@ -5607,6 +5657,7 @@ class CompanyWorkItemExecutor:
         task.context_snapshot = dict(task.context_snapshot or {})
         task.metadata.pop("self_evolution_patch_retry_feedback", None)
         task.context_snapshot.pop("self_evolution_patch_retry_feedback", None)
+        task.metadata.pop("self_evolution_submitted_patch", None)
         task.metadata["self_evolution_patch_retry_count"] = retry_count
         task.metadata["self_evolution_recorded"] = list(recorded)
         task.metadata["self_evolution_patch"] = {"patches": patches}
@@ -14011,6 +14062,13 @@ class CompanyWorkItemExecutor:
         except Exception:
             logger.opt(exception=True).debug("run failure settlement: work item load failed")
             return
+        # Self-evolution items are an opt-in post-delivery reflection pass;
+        # their outcome must never decide the business run's terminal verdict.
+        work_items = [
+            item
+            for item in work_items
+            if str(getattr(item, "kind", "") or "").strip().lower() != "self_evolution"
+        ]
         if not work_items:
             return
         if any(getattr(item, "phase", None) not in DONE_PHASES for item in work_items):

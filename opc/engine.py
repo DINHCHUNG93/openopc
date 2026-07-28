@@ -11146,6 +11146,12 @@ class OPCEngine:
                 return "This request is no longer active."
             if str(getattr(checkpoint, "status", "") or "").strip().lower() != "pending":
                 if str(getattr(checkpoint, "checkpoint_type", "") or "").strip() == "company_delivery_feedback":
+                    if str(getattr(checkpoint, "status", "") or "").strip().lower() == "consuming":
+                        # Duplicate approve/feedback while the first reply is
+                        # still driving the self-evolution run: answer
+                        # idempotently instead of re-routing the click as a
+                        # fresh session message.
+                        return "Self-evolution for this delivery is already running."
                     return None
                 return "This request is no longer active."
             if not await self._checkpoint_task_still_waiting(checkpoint):
@@ -12742,10 +12748,12 @@ class OPCEngine:
         task_brief = (
             "Run employee self-evolution for this role from the completed company delivery review.\n"
             f"{review_text}\n\n"
-            "Decide whether your assigned employee should update its experience. If direct reports should also learn, "
-            "delegate child WorkItems with `work_kind=\"self_evolution\"`. Do not continue the original user task, "
-            "do not edit files, and do not produce a user-facing report. Final response must be strict JSON only: "
-            "`{\"patches\": [...]}`."
+            "Decide whether your assigned employee should update its experience, then record the result "
+            "by calling the `submit_self_evolution_patches` tool (an empty `patches` list means no update "
+            "is needed). The tool submission is the authoritative result of this turn; the final text can "
+            "be a brief completion note. If direct reports should also learn, delegate child WorkItems "
+            "with `work_kind=\"self_evolution\"`. Do not continue the original user task, do not edit "
+            "files, and do not produce a user-facing report."
         )
         return make_prompt_contract(
             task_brief=task_brief,
@@ -12757,14 +12765,15 @@ class OPCEngine:
             owned_outcome_kind="self_evolution",
             scope_key=f"self_evolution::{source.get('checkpoint_id', '')}::{role_id}",
             deliverables=[
-                "Strict JSON only with top-level `patches` list.",
+                "A `submit_self_evolution_patches` tool call recording this role's patches.",
                 "Use `patches: []` if no employee experience update is needed for this role.",
                 "Use `delegate_work` with `work_kind=\"self_evolution\"` for direct reports that should reflect on their own work.",
             ],
             acceptance_criteria=[
-                "No prose, markdown, file edits, or user-facing delivery content.",
+                "Patches are recorded through the `submit_self_evolution_patches` tool, not only in free text.",
                 "Patch employee_id must be the employee assigned to this role's self-evolution work item.",
                 "Each patch may include summary, strengths, adjustments, avoid_next_time, routing_notes, evidence_task_ids, and confidence.",
+                "No file edits or user-facing delivery content.",
             ],
             coordination_notes=json.dumps(
                 {
@@ -13009,6 +13018,46 @@ class OPCEngine:
                 })
         return {"recorded": recorded, "errors": errors}
 
+    # Total wall-clock budget for one delivery-review self-evolution pass
+    # (root reflection plus any delegated child reflections). The reply to
+    # the review card blocks on this pass like every other company message,
+    # so a stuck reflection must have a bounded lifetime.
+    _SELF_EVOLUTION_RUN_TIMEOUT_SEC: float = 2400.0
+
+    async def _settle_self_evolution_deadline(self, run_id: str) -> None:
+        """Cancel non-terminal self-evolution work items after the time budget."""
+        if not self.store or not run_id:
+            return
+        list_work_items = getattr(self.store, "list_delegation_work_items", None)
+        if not callable(list_work_items):
+            return
+        try:
+            work_items = await list_work_items(run_id)
+        except Exception:
+            logger.opt(exception=True).debug("self-evolution deadline: work item load failed")
+            return
+        from opc.layer2_organization.work_item_transition import transition_work_item
+
+        for item in list(work_items or []):
+            if str(getattr(item, "kind", "") or "").strip().lower() != "self_evolution":
+                continue
+            if getattr(item, "phase", None) in DONE_PHASES:
+                continue
+            try:
+                await transition_work_item(
+                    self.store,
+                    str(getattr(item, "work_item_id", "") or ""),
+                    target_phase=Phase.CANCELLED,
+                    reason="self_evolution_deadline",
+                    summary="Self-evolution run exceeded its time budget and was closed.",
+                    release_claim=True,
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "self-evolution deadline: cancel failed for work item "
+                    f"{getattr(item, 'work_item_id', '')}"
+                )
+
     async def run_company_delivery_self_evolution_checkpoint(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -13025,9 +13074,47 @@ class OPCEngine:
             )
         checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
         status = str(getattr(checkpoint, "status", "") or "").strip().lower()
+        if status == "consuming":
+            return "Self-evolution for this delivery is already running."
         if status and status != "pending":
             return "This self-evolution review is no longer active."
+        # Claim the card before spawning anything: a second approve/feedback
+        # while this one is processing must not re-enter and reset the live
+        # self-evolution work item (same defect class as duplicate resume).
+        claimed = await self._mark_company_runtime_checkpoint_status(
+            checkpoint,
+            status="consuming",
+            payload_updates={"self_evolution_claimed_at": datetime.now().isoformat()},
+            expected_statuses={"pending"},
+        )
+        if not claimed:
+            return "Self-evolution for this delivery is already running."
+        try:
+            return await self._run_company_delivery_self_evolution_consumed(
+                checkpoint,
+                action=action,
+                feedback=feedback,
+            )
+        except Exception as exc:
+            # An unexpected crash must not strand the card in "consuming"
+            # (that would answer every retry with "already running" forever)
+            # — hand the claim back so the user can retry.
+            await self._mark_company_runtime_checkpoint_status(
+                checkpoint,
+                status="pending",
+                payload_updates={"self_evolution_consume_error": str(exc)[:500]},
+                expected_statuses={"consuming"},
+            )
+            raise
 
+    async def _run_company_delivery_self_evolution_consumed(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        action: str,
+        feedback: str = "",
+    ) -> str:
+        assert self.store
         payload = dict(checkpoint.payload or {})
         waiting_task_id = str(payload.get("waiting_task_id", "") or payload.get("task_id", "") or "").strip()
         if not waiting_task_id:
@@ -13129,11 +13216,22 @@ class OPCEngine:
             tasks=tasks,
             root_work_item=root_work_item,
         )
-        await self.company_executor.execute(plan, tasks)
+        run_id = str(getattr(root_work_item, "run_id", "") or "").strip()
+        deadline_hit = False
+        try:
+            await asyncio.wait_for(
+                self.company_executor.execute(plan, tasks),
+                timeout=self._SELF_EVOLUTION_RUN_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            deadline_hit = True
+            await self._settle_self_evolution_deadline(run_id)
         result = await self._collect_company_self_evolution_result(
             checkpoint_id=checkpoint.checkpoint_id,
-            run_id=str(getattr(root_work_item, "run_id", "") or "").strip(),
+            run_id=run_id,
         )
+        if deadline_hit:
+            result.setdefault("errors", []).append({"error": "self_evolution_deadline"})
 
         waiting_task.metadata = dict(waiting_task.metadata or {})
         review_record = {
@@ -13165,6 +13263,12 @@ class OPCEngine:
             task_metadata_updates=task_metadata_updates,
         )
         recorded_count = len(result.get("recorded", []))
+        if deadline_hit:
+            return (
+                f"Self-evolution hit its {int(self._SELF_EVOLUTION_RUN_TIMEOUT_SEC // 60)}-minute "
+                f"time budget and was closed with {recorded_count} recorded update(s); "
+                "the remaining reflection work was cancelled."
+            )
         if recorded_count:
             return f"Self-evolution completed. Recorded {recorded_count} employee experience update(s)."
         errors = list(result.get("errors", []))

@@ -3369,7 +3369,11 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(retry.status, TaskStatus.PENDING)
         self.assertEqual(task.metadata["self_evolution_patch_retry_count"], 1)
-        self.assertIn("strict JSON", task.context_snapshot["self_evolution_patch_retry_feedback"])
+        # Retry feedback points the agent at the authoritative tool channel.
+        self.assertIn(
+            "submit_self_evolution_patches",
+            task.context_snapshot["self_evolution_patch_retry_feedback"],
+        )
         save_task.assert_awaited_once()
 
         task.metadata["self_evolution_patch_retry_count"] = 2
@@ -3377,8 +3381,10 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             task,
             TaskResult(status=TaskStatus.DONE, content="still not json", artifacts={}),
         )
-        self.assertEqual(failed.status, TaskStatus.FAILED)
-        self.assertEqual(task.status, TaskStatus.FAILED)
+        # Abandoned reflection settles CANCELLED so it cannot pollute the
+        # delivered run's terminal verdict (the error record keeps the why).
+        self.assertEqual(failed.status, TaskStatus.CANCELLED)
+        self.assertEqual(task.status, TaskStatus.CANCELLED)
         self.assertEqual(task.metadata["self_evolution_error"]["attempts"], 3)
 
     async def test_self_evolution_work_item_retries_patch_for_wrong_employee(self) -> None:
