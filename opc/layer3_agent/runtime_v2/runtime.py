@@ -39,7 +39,7 @@ from opc.layer4_tools.output_budget import clip_text
 from opc.layer4_tools.registry import ToolDefinition
 from opc.layer4_tools.registry import ToolRegistry
 from opc.layer6_observability.cost_tracker import CostEntry
-from opc.llm.provider import LLMProvider
+from opc.llm.provider import LLMProvider, ProviderQuotaExhaustedError
 
 
 ApprovalCallback = Callable[[ToolDefinition, dict[str, Any], Optional[Task], Any], Awaitable[tuple[bool, Any]]]
@@ -537,6 +537,23 @@ class NativeRuntimeV2:
                             },
                         )
             except Exception as exc:
+                rate_limit_checker = getattr(self.llm, "is_rate_limit_error", None)
+                if callable(rate_limit_checker) and rate_limit_checker(exc):
+                    # Quota/rate-limit rejections never reach the model, so
+                    # conversation-feedback retries cannot help — surface a
+                    # typed error for the dispatcher to park on instead of
+                    # burning retries and failing the work item (OBS-6).
+                    await self._cancel_early_tool_runs(early_tool_runs)
+                    await self._emit_runtime_event(
+                        runtime_session_id,
+                        task,
+                        "provider_quota_exhausted",
+                        {
+                            "iteration": iteration + 1,
+                            "message": str(exc)[:600],
+                        },
+                    )
+                    raise ProviderQuotaExhaustedError(str(exc)) from exc
                 if self.llm.is_context_overflow_error(exc) and overflow_retries < max_overflow_retries:
                     overflow_retries += 1
                     messages = await self._apply_context_pipeline(

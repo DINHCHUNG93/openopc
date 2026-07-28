@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import re
+import time
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field
@@ -156,6 +157,7 @@ from opc.layer2_organization.work_item_runtime_invariants import (
     validate_work_item_runtime_projection,
 )
 from opc.layer4_tools.output_budget import clip_text
+from opc.llm.provider import ProviderQuotaExhaustedError
 from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 
 
@@ -1423,6 +1425,13 @@ class CompanyWorkItemExecutor:
         # waits on this Event so children are claimed+spawned without
         # waiting for the parent turn's gather batch to drain.
         self._dispatcher_wake = asyncio.Event()
+        # Provider-quota park (OBS-6): while monotonic time is below
+        # _quota_park_until the dispatcher stops claiming new work instead of
+        # hammering an exhausted quota. The streak drives exponential backoff
+        # (60s → 900s cap); parks separated by more than 30 min restart it.
+        self._quota_park_until = 0.0
+        self._quota_park_streak = 0
+        self._quota_last_park_at = 0.0
         # Single-dispatcher-per-run invariant: refcount of live
         # _execute_multi_team_org loops keyed by delegation run id.
         # Checkpoint answers consult this via wake_live_run_dispatcher —
@@ -4760,12 +4769,23 @@ class CompanyWorkItemExecutor:
                 self._rehydrate_parked_member_sessions(work_items)
                 # Claim whatever is immediately claimable and spawn each
                 # work item as an independent asyncio.Task so the loop no
-                # longer blocks on the slowest sibling.
-                claims = await self._claim_and_create_work_item_tasks(
-                    tasks,
-                    work_items,
-                    active_work_item_tasks,
-                )
+                # longer blocks on the slowest sibling. While a provider
+                # quota park is active, claiming is skipped so an exhausted
+                # quota is not hammered with doomed dispatches (OBS-6).
+                if self._quota_park_until and time.monotonic() < self._quota_park_until:
+                    claims = []
+                else:
+                    if self._quota_park_until:
+                        self._quota_park_until = 0.0
+                        await self._emit_progress(
+                            "[Company] provider quota backoff elapsed — resuming dispatch",
+                            task_id=tasks[0].id if tasks else "",
+                        )
+                    claims = await self._claim_and_create_work_item_tasks(
+                        tasks,
+                        work_items,
+                        active_work_item_tasks,
+                    )
                 # Termination: only when nothing is in-flight AND nothing
                 # else is runnable.  If work items are still running, even an
                 # "empty runnable" snapshot may become non-empty within
@@ -4972,6 +4992,10 @@ class CompanyWorkItemExecutor:
                             res,
                         )
                 active_work_item_tasks.clear()
+        try:
+            await self._settle_run_lifecycle_on_convergence(tasks)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement skipped")
         return self._summarize_multi_team_org_results(tasks)
 
     @staticmethod
@@ -5136,12 +5160,80 @@ class CompanyWorkItemExecutor:
             ) == "running"
         )
 
+    def _exception_is_provider_quota(self, exc: BaseException | None) -> bool:
+        seen: set[int] = set()
+        while exc is not None and id(exc) not in seen:
+            if isinstance(exc, ProviderQuotaExhaustedError):
+                return True
+            seen.add(id(exc))
+            exc = exc.__cause__ or exc.__context__
+        return False
+
+    async def _park_claimed_work_item_for_quota(
+        self,
+        member_session: CompanyMemberSession,
+        task: Task,
+        exc: Exception,
+    ) -> None:
+        """Return the item to READY and back off instead of failing it.
+
+        An exhausted provider quota is an environment outage, not a defect in
+        the work: failing the card (the previous behavior) terminally killed
+        intake and with it the whole run, with no way to continue after the
+        quota window reset (OBS-6). Parking keeps the run alive; dispatch
+        resumes automatically after the backoff, and stop/resume stays
+        available throughout.
+        """
+        projection_id = self._projection_id_for_task(task)
+        now = time.monotonic()
+        if now - self._quota_last_park_at > 1800:
+            self._quota_park_streak = 0
+        self._quota_park_streak += 1
+        self._quota_last_park_at = now
+        backoff_sec = min(60 * (2 ** (self._quota_park_streak - 1)), 900)
+        self._quota_park_until = now + backoff_sec
+        summary = (
+            f"[Company:{projection_id}] provider quota/rate limit exhausted — "
+            f"work item returned to the queue; dispatch pauses for {backoff_sec}s "
+            f"(streak {self._quota_park_streak}). {str(exc)[:300]}"
+        )
+        logger.warning(summary)
+        if self._claimed_work_item_needs_cleanup(member_session, task):
+            try:
+                await transition_work_item_from_task(
+                    self.store, task,
+                    target_status_or_phase=Phase.READY,
+                    reason="provider_quota_exhausted",
+                    summary=summary or None,
+                    release_claim=True,
+                    attempt_outcome="interrupted",
+                )
+            except Exception:
+                logger.opt(exception=True).error(
+                    f"[Company:{projection_id}] quota park: READY transition failed"
+                )
+        self.runtime._claimed_task_ids.discard(task.id)
+        work_item_id = linked_work_item_id_for_task(task)
+        if work_item_id:
+            self.runtime._claimed_work_item_ids.discard(work_item_id)
+        member_session.status = "idle"
+        member_session.resident_status = "idle"
+        member_session.current_task_id = ""
+        member_session.focused_work_item_id = ""
+        member_session.current_work_item = {}
+        member_session.current_assignment = {}
+        member_session.updated_at = datetime.now()
+        await self._emit_progress(summary, task_id=task.id)
+
     async def _handle_claimed_work_item_exception(
         self,
         member_session: CompanyMemberSession,
         task: Task,
         exc: Exception,
     ) -> None:
+        if self._exception_is_provider_quota(exc):
+            await self._park_claimed_work_item_for_quota(member_session, task, exc)
+            return
         projection_id = self._projection_id_for_task(task)
         work_item_id = linked_work_item_id_for_task(task)
         summary = (
@@ -13897,6 +13989,126 @@ class CompanyWorkItemExecutor:
             await self.store.save_delegation_run(run)
         except Exception:
             logger.opt(exception=True).debug("Failed to save delegation run owner review lifecycle update")
+
+    async def _settle_run_lifecycle_on_convergence(self, tasks: list[Task]) -> None:
+        """Close the delegation run when its tree converged in terminal failure.
+
+        The success path closes through delivery review (awaiting_owner plus
+        the feedback card). A run whose intake or delivery failed previously
+        stayed running/active forever: no closure signal, no card, and new
+        session input was routed into resuming the dead run (OBS-5).
+        """
+        if not self.store or not hasattr(self.store, "get_delegation_run"):
+            return
+        run_id = self._delegation_run_id_for_tasks(tasks)
+        if not run_id:
+            return
+        list_work_items = getattr(self.store, "list_delegation_work_items", None)
+        if not callable(list_work_items):
+            return
+        try:
+            work_items = await list_work_items(run_id)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement: work item load failed")
+            return
+        if not work_items:
+            return
+        if any(getattr(item, "phase", None) not in DONE_PHASES for item in work_items):
+            return
+        failed_core = [
+            item
+            for item in work_items
+            if str(getattr(item, "kind", "") or "").strip().lower() in {"intake", "delivery"}
+            and getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
+        ]
+        if not failed_core:
+            return
+        try:
+            run = await self.store.get_delegation_run(run_id)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement: run load failed")
+            return
+        if run is None:
+            return
+        lifecycle = str(getattr(run, "lifecycle_status", "") or "").strip()
+        if lifecycle in {"closed_failed", "awaiting_owner"}:
+            return
+        failed_items = [
+            {
+                "work_item_id": str(getattr(item, "work_item_id", "") or ""),
+                "kind": str(getattr(item, "kind", "") or ""),
+                "role_id": str(getattr(item, "role_id", "") or ""),
+                "phase": str(getattr(getattr(item, "phase", None), "value", "") or ""),
+                "blocked_reason": str(getattr(item, "blocked_reason", "") or "")[:300],
+            }
+            for item in work_items
+            if getattr(item, "phase", None) in {Phase.FAILED, Phase.CANCELLED}
+        ]
+        closed_at = datetime.now().isoformat()
+        run.status = (
+            "failed"
+            if any(item["phase"] == Phase.FAILED.value for item in failed_items)
+            else "cancelled"
+        )
+        run.lifecycle_status = "closed_failed"
+        run.metadata = {
+            **dict(run.metadata or {}),
+            "run_failure": {
+                "closed_at": closed_at,
+                "failed_items": failed_items,
+            },
+        }
+        try:
+            await self.store.save_delegation_run(run)
+        except Exception:
+            logger.opt(exception=True).debug("run failure settlement: run save failed")
+            return
+        origin_task = tasks[0] if tasks else None
+        failure_lines = "\n".join(
+            f"- `{item['kind']}::{item['role_id']}` {item['phase']}"
+            + (f" — {item['blocked_reason']}" if item["blocked_reason"] else "")
+            for item in failed_items
+        )
+        await self._emit_progress(
+            f"[Company] run closed after terminal failure — {len(failed_items)} "
+            f"failed/cancelled work item(s). Send a new request to start a fresh run.",
+            task_id=origin_task.id if origin_task else "",
+        )
+        if self.checkpoint_callback and origin_task is not None:
+            original_request = str(
+                (origin_task.metadata or {}).get("original_request", "")
+                or origin_task.description
+                or origin_task.title
+                or ""
+            ).strip()
+            try:
+                await self.checkpoint_callback(
+                    {
+                        "checkpoint_type": "company_run_failure_review",
+                        "project_id": origin_task.project_id,
+                        "session_id": origin_task.session_id,
+                        "task_id": origin_task.id,
+                        "payload": {
+                            "run_id": run_id,
+                            "waiting_task_id": origin_task.id,
+                            "session_id": origin_task.session_id,
+                            "task_ids": [t.id for t in tasks],
+                            "closed_at": closed_at,
+                            "failed_items": failed_items,
+                            "original_request": original_request,
+                            "prompt": (
+                                "This company run ended with failed work items and has "
+                                "been closed.\n\n"
+                                f"{failure_lines}\n\n"
+                                "Reply `dismiss` to acknowledge, or send a new request "
+                                "(for example the original goal with adjustments) to "
+                                "start a fresh run."
+                            ),
+                        },
+                    }
+                )
+            except Exception:
+                logger.opt(exception=True).debug("run failure settlement: checkpoint save failed")
 
     async def _finalize_completed_work_item(self, task: Task) -> None:
         if self._is_authoritative_delivery_work_item(task):

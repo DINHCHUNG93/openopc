@@ -1280,11 +1280,50 @@ class OPCEngine:
             if str(item.get("template_id", "") or "").strip()
         }
         roles: list[dict[str, Any]] = []
-        default_agent = "codex"
+        # The card's per-role agent defaults become recruitment_role_agents on
+        # approve, which outrank the session-level agent choice as explicit
+        # per-role overrides. They must therefore be the RESOLVED effective
+        # backend, not a hardcoded external preference: an explicit
+        # preferred_agent from the user wins, a role template preference only
+        # applies when that adapter can actually run, everything else is
+        # native. (OBS-11: hardcoded "codex" defaults poisoned the execution
+        # identity of runs the user explicitly requested as native.)
+        explicit_session_agent = normalize_recruitment_agent_choice(
+            getattr(decision, "preferred_agent", None)
+        )
+        available_external_agents = set(self._available_external_agents())
+
+        def _staffing_agent_is_runnable(agent_name: str) -> bool:
+            # Unknown availability (no adapter registry) fails open, matching
+            # the dispatch selector; a registry that exists and excludes the
+            # agent is proof it cannot run.
+            if agent_name == "native":
+                return True
+            if self.adapter_registry is None:
+                return True
+            return agent_name in available_external_agents
+
         for agent in self.org_engine.list_agents():
             role_id = str(getattr(agent, "role_id", "") or "").strip()
             if not role_id or role_id == "task_generalist":
                 continue
+            role_preferred_agent = normalize_recruitment_agent_choice(
+                getattr(agent, "preferred_external_agent", None)
+            )
+            if explicit_session_agent:
+                default_agent = (
+                    explicit_session_agent
+                    if _staffing_agent_is_runnable(explicit_session_agent)
+                    else "native"
+                )
+            elif (
+                role_preferred_agent
+                and role_preferred_agent != "native"
+                and _staffing_agent_is_runnable(role_preferred_agent)
+            ):
+                default_agent = role_preferred_agent
+            else:
+                default_agent = "native"
             same_role_employees = employee_by_role.get(role_id, [])
             default_selection: dict[str, Any] = {"kind": "fallback"}
             default_source = "system"
@@ -1311,6 +1350,8 @@ class OPCEngine:
                 }
                 default_source = "org"
             selected_agent = normalize_recruitment_agent_choice(saved_agents.get(role_id), default=default_agent) or default_agent
+            if not _staffing_agent_is_runnable(selected_agent):
+                selected_agent = default_agent
             roles.append(
                 {
                     "role_id": role_id,
@@ -2917,6 +2958,7 @@ class OPCEngine:
             else None
         )
         explicit_force_native = explicit_agent_choice == "native"
+        enrichment_available_external_agents = set(self._available_external_agents())
         seats: list[dict[str, Any]] = []
         for raw_seat in list(enriched.get("seats", []) or []):
             seat = dict(raw_seat or {})
@@ -2972,6 +3014,21 @@ class OPCEngine:
                 or explicit_agent_choice
                 or ("native" if force_native_execution or not preferred_external_agent else preferred_external_agent)
             )
+            execution_agent_unavailable = ""
+            if (
+                selected_execution_agent
+                and selected_execution_agent != "native"
+                and self.adapter_registry is not None
+                and selected_execution_agent not in enrichment_available_external_agents
+            ):
+                # The chosen external backend cannot run. Dispatch would fall
+                # back to native while seat/task metadata kept claiming the
+                # external agent, and the resume gate trusts that identity
+                # (OBS-11). Record the truth up front; the wish stays visible
+                # via execution_agent_unavailable.
+                execution_agent_unavailable = selected_execution_agent
+                selected_execution_agent = "native"
+                preferred_external_agent = None
             execution_agent_locked = bool(selected_role_agent or explicit_agent_choice)
             selection_source = (
                 "recruitment_user_override"
@@ -2987,6 +3044,7 @@ class OPCEngine:
             seat["execution_agent_locked"] = execution_agent_locked
             seat["selected_execution_agent_source"] = selection_source
             seat["force_native_execution"] = force_native_execution
+            seat["execution_agent_unavailable"] = execution_agent_unavailable
             seat["metadata"] = {
                 **dict(seat.get("metadata", {}) or {}),
                 "employee_prompt_context": str((employee_assignment or {}).get("prompt_context", "")).strip(),
@@ -4740,6 +4798,28 @@ class OPCEngine:
             default=("native" if not str(task.assigned_external_agent or "").strip() else str(task.assigned_external_agent or "").strip()),
         )
         if task.metadata.get("execution_agent_locked") and locked_agent:
+            if (
+                locked_agent != "native"
+                and self.adapter_registry is not None
+                and locked_agent not in self._available_external_agents()
+            ):
+                # A locked external backend that cannot run must not be
+                # stamped as execution identity: this attempt actually runs
+                # native (the external candidate pool is empty) and resume
+                # trusts this metadata (OBS-11).
+                task.assigned_external_agent = None
+                task.metadata["selected_execution_agent"] = "native"
+                task.metadata["preferred_external_agent"] = None
+                task.metadata["execution_agent_unavailable"] = locked_agent
+                task.metadata["agent_selection"] = {
+                    "selected": "native",
+                    "strategy": WorkItemExecutionStrategy.NATIVE.value,
+                    "role_id": task.assigned_to or task.metadata.get("work_item_role_id", ""),
+                    "decision_reason": "locked_external_agent_unavailable_native_fallback",
+                    "available_external_agents": self._available_external_agents(),
+                    "selection_source": "availability_fallback",
+                }
+                return None
             selected = None if locked_agent == "native" else locked_agent
             task.assigned_external_agent = selected
             task.metadata["preferred_external_agent"] = selected
@@ -6384,12 +6464,59 @@ class OPCEngine:
             # not fully initialized / delegate context) — fail open and let the
             # dispatch-time selector guard decide; only a registry that exists
             # and excludes the pinned agent is proof of unavailability.
-            if (
+            pinned_agent_unavailable = bool(
                 pinned_agent != "native"
                 and not work_item_already_terminal
                 and self.adapter_registry is not None
                 and pinned_agent not in self._available_external_agents()
-            ):
+            )
+            if pinned_agent_unavailable:
+                gate_external_session = dict(
+                    (payload.get("external_sessions", {}) or {}).get(task.id) or {}
+                )
+                has_resumable_external_session = bool(
+                    gate_external_session
+                ) and external_session_status_allows_resume(
+                    gate_external_session.get("status")
+                )
+                if not has_resumable_external_session:
+                    # The pin is a preference, not a fact: this work item has
+                    # no external session to revive, so dispatch would run it
+                    # natively anyway (availability fallback). Heal the
+                    # checkpointed identity to native and resume instead of
+                    # failing the item — a run the user launched as native
+                    # must survive stop/resume even when a disabled external
+                    # agent leaked into its metadata (OBS-11).
+                    healed_identity = dict(
+                        task_snapshot.get("execution_identity", {}) or {}
+                    )
+                    healed_identity["selected_execution_agent"] = "native"
+                    healed_identity["assigned_external_agent"] = ""
+                    if not str(
+                        healed_identity.get("preferred_external_agent", "") or ""
+                    ).strip():
+                        healed_identity["preferred_external_agent"] = pinned_agent
+                    task_snapshot["execution_identity"] = healed_identity
+                    task_snapshot["selected_execution_agent"] = "native"
+                    task_snapshot["assigned_external_agent"] = ""
+                    # The task's durable identity must agree with the healed
+                    # snapshot, or the restore validation below rejects the
+                    # resume as an identity mismatch.
+                    task.metadata = dict(task.metadata or {})
+                    task.metadata["resume_execution_agent_healed_from"] = pinned_agent
+                    task.metadata["selected_execution_agent"] = "native"
+                    task.metadata.pop("agent_selection", None)
+                    task.metadata.pop("preferred_external_agent", None)
+                    task.assigned_external_agent = None
+                    logger.info(
+                        "company runtime resume: healed work item {} to native — pinned "
+                        "external agent {!r} is unavailable and no resumable external "
+                        "session exists",
+                        work_item_id or task.id,
+                        pinned_agent,
+                    )
+                    pinned_agent_unavailable = False
+            if pinned_agent_unavailable:
                 diagnostic = (
                     f"Cannot resume work item: its execution is pinned to external agent "
                     f"'{pinned_agent}', which is currently disabled or unavailable. "
@@ -8546,7 +8673,43 @@ class OPCEngine:
 
     @staticmethod
     def _reply_metadata_requests_force_resume(reply_metadata: dict[str, Any] | None) -> bool:
-        return bool(dict(reply_metadata or {}).get("ui_force_resume", False))
+        metadata = dict(reply_metadata or {})
+        # ui_force_resume is what the Office UI resume button sends;
+        # force_resume is the documented key for chat/headless callers.
+        # Both express the same control intent (OBS-11: only recognizing the
+        # UI spelling pushed headless resumes into the content-followup path).
+        return bool(
+            metadata.get("ui_force_resume", False)
+            or metadata.get("force_resume", False)
+        )
+
+    @staticmethod
+    def _is_plain_resume_control_reply(user_reply: str) -> bool:
+        """A bare continuation acknowledgement carries no new instructions.
+
+        Such a reply to a suspended-runtime checkpoint means "resume the run",
+        never "route this text to the final decider as a follow-up" — routing
+        it as content reopens the already-approved intake card and churns the
+        run it was supposed to continue (OBS-11).
+        """
+        normalized = " ".join(str(user_reply or "").strip().lower().split())
+        return normalized in {
+            "",
+            "continue",
+            "resume",
+            "proceed",
+            "go",
+            "go on",
+            "ok",
+            "okay",
+            "y",
+            "yes",
+            # Chinese spellings of the same continuation intent.
+            "继续",
+            "恢复",
+            "继续执行",
+            "继续跑",
+        }
 
     async def _maybe_resume_existing_company_runtime(
         self,
@@ -8579,6 +8742,28 @@ class OPCEngine:
             blocked_tasks = [task for task in tasks if task.status == TaskStatus.BLOCKED]
             no_active_runtime_work = not live_running_tasks and not waiting_tasks and not pending_tasks and not failed_tasks and not blocked_tasks
             has_closed_delivery_review = any(self._is_closed_company_delivery_review_task(task) for task in tasks)
+            run_terminally_failed = (
+                bool(failed_tasks)
+                and not has_closed_delivery_review
+                and all(
+                    t.status in {TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.FAILED}
+                    for t in tasks
+                )
+            )
+            if run_terminally_failed:
+                # The run is a corpse: re-executing it drops the user's new
+                # content on the floor (OBS-5). Content-bearing input falls
+                # through to start a fresh run; bare control replies get an
+                # honest status instead of a fake resume.
+                if force_resume or self._is_plain_resume_control_reply(user_reply):
+                    snapshot_text = self._format_company_runtime_snapshot(tasks)
+                    return (
+                        "This company run ended with failed work items and is closed. "
+                        "It cannot be resumed. Send a new request (for example the "
+                        "original goal, optionally adjusted) to start a fresh run.\n\n"
+                        f"{snapshot_text}"
+                    )
+                return None
             if not force_resume:
                 if not (no_active_runtime_work and has_closed_delivery_review):
                     followup_result = await self._resume_company_runtime_via_final_decider(
@@ -10997,9 +11182,29 @@ class OPCEngine:
         if checkpoint.checkpoint_type == "company_work_item_gate":
             return await self._resume_company_runtime_checkpoint(checkpoint, user_reply)
         if self._is_company_runtime_suspend_checkpoint(checkpoint.checkpoint_type):
-            if self._reply_metadata_requests_force_resume(reply_metadata):
+            if self._reply_metadata_requests_force_resume(
+                reply_metadata
+            ) or self._is_plain_resume_control_reply(user_reply):
                 return await self._resume_company_suspend_checkpoint(checkpoint, user_reply)
             return await self._resume_company_suspend_checkpoint_via_final_decider(checkpoint, user_reply)
+        if checkpoint.checkpoint_type == "company_run_failure_review":
+            if not explicit_checkpoint_id:
+                # Closure cards must never swallow ordinary session messages.
+                return None
+            normalized_failure_reply = " ".join(
+                str(user_reply or "").strip().lower().split()
+            )
+            await self.store.resolve_execution_checkpoint(
+                checkpoint.checkpoint_id, status="resolved"
+            )
+            if normalized_failure_reply in {
+                # trailing entries are Chinese acknowledgement spellings
+                "", "dismiss", "ignore", "close", "ok", "okay", "知道了", "关闭",
+            }:
+                return "Company run closure acknowledged."
+            # Content-bearing reply: the failed run is closed, so let the
+            # message continue as a fresh request through normal routing.
+            return None
         if checkpoint.checkpoint_type == "company_delivery_feedback":
             if not explicit_checkpoint_id:
                 return None

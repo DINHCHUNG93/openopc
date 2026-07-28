@@ -411,7 +411,19 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(checkpoint.payload["recommended_action"], "auto_recruit")
             self.assertEqual(checkpoint.payload["staffing_defaults"]["source"], "system")
             self.assertTrue(all(role["default_selection"]["kind"] == "fallback" for role in checkpoint.payload["staffing_roles"]))
-            self.assertTrue(all(role["selected_agent"] == "codex" for role in checkpoint.payload["staffing_roles"]))
+            # Card defaults become per-role overrides on approve, so they must
+            # reflect what will actually run (OBS-11): the role template's
+            # external preference when it can run, native otherwise.
+            agents_by_role = {
+                role["role_id"]: role["selected_agent"]
+                for role in checkpoint.payload["staffing_roles"]
+            }
+            self.assertTrue(all(
+                role["selected_agent"] == role["default_agent"]
+                for role in checkpoint.payload["staffing_roles"]
+            ))
+            self.assertEqual(agents_by_role.get("ceo"), "native")
+            self.assertEqual(agents_by_role.get("senior_engineer"), "codex")
             self.assertEqual(llm.calls, [])
             self.assertEqual(tasks, [])
             await store.close()
@@ -634,7 +646,21 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(checkpoint.payload["staffing_pool"]["employees"], [])
             self.assertGreater(len(checkpoint.payload["staffing_roles"]), 0)
             self.assertTrue(all(role["default_selection"]["kind"] == "fallback" for role in checkpoint.payload["staffing_roles"]))
-            self.assertTrue(all(role["selected_agent"] == "codex" for role in checkpoint.payload["staffing_roles"]))
+            # Card defaults become per-role overrides on approve, so they must
+            # reflect what will actually run (OBS-11): the role template's
+            # external preference when it can run, native otherwise.
+            agents_by_role = {
+                role["role_id"]: role["selected_agent"]
+                for role in checkpoint.payload["staffing_roles"]
+            }
+            self.assertTrue(all(
+                role["selected_agent"] == role["default_agent"]
+                for role in checkpoint.payload["staffing_roles"]
+            ))
+            # decision.preferred_agent="opencode" is an explicit session-level
+            # choice and outranks role template preferences.
+            self.assertEqual(agents_by_role.get("ceo"), "opencode")
+            self.assertEqual(agents_by_role.get("senior_engineer"), "opencode")
             template_ids = {item["template_id"] for item in checkpoint.payload["staffing_pool"]["templates"]}
             self.assertIn("engineering-frontend-developer", template_ids)
             self.assertEqual(llm.calls, [])
@@ -744,7 +770,7 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(senior_role["selected_agent"], "opencode")
             ceo_role = next(role for role in payload["staffing_roles"] if role["role_id"] == "ceo")
             self.assertEqual(ceo_role["default_selection"], {"kind": "fallback", "id": ""})
-            self.assertEqual(ceo_role["selected_agent"], "codex")
+            self.assertEqual(ceo_role["selected_agent"], "native")
             await store.close()
 
     async def test_confirmed_session_reuses_staffing_defaults_without_recruiter_llm(self) -> None:
@@ -1476,7 +1502,19 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint.checkpoint_type, "company_staffing_selection")
             self.assertEqual(checkpoint.payload["staffing_defaults"]["source"], "system")
-            self.assertTrue(all(role["selected_agent"] == "codex" for role in checkpoint.payload["staffing_roles"]))
+            # Card defaults become per-role overrides on approve, so they must
+            # reflect what will actually run (OBS-11): the role template's
+            # external preference when it can run, native otherwise.
+            agents_by_role = {
+                role["role_id"]: role["selected_agent"]
+                for role in checkpoint.payload["staffing_roles"]
+            }
+            self.assertTrue(all(
+                role["selected_agent"] == role["default_agent"]
+                for role in checkpoint.payload["staffing_roles"]
+            ))
+            self.assertEqual(agents_by_role.get("ceo"), "native")
+            self.assertEqual(agents_by_role.get("senior_engineer"), "codex")
             await store.close()
 
     async def test_deny_recruitment_cancels_execution(self) -> None:
