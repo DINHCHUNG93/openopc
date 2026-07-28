@@ -1423,6 +1423,14 @@ class CompanyWorkItemExecutor:
         # waits on this Event so children are claimed+spawned without
         # waiting for the parent turn's gather batch to drain.
         self._dispatcher_wake = asyncio.Event()
+        # Single-dispatcher-per-run invariant: refcount of live
+        # _execute_multi_team_org loops keyed by delegation run id.
+        # Checkpoint answers consult this via wake_live_run_dispatcher —
+        # a live run receives input in place instead of a second
+        # _execute_company_mode entry (re-entry reset live claim
+        # registries and the attempt ledger stamped every in-flight
+        # card as interrupted).
+        self._live_run_dispatchers: dict[str, int] = {}
         if communication is not None and getattr(communication, "on_work_items_created", None) is None:
             communication.on_work_items_created = self._signal_dispatcher_wake
         # D2: register the wake callback with the phase-transition hook
@@ -4580,6 +4588,31 @@ class CompanyWorkItemExecutor:
             if ownership is not None:
                 ownership.release()
 
+    def wake_live_run_dispatcher(self, run_id: str) -> bool:
+        """Wake the live dispatcher for ``run_id``; False when none is live.
+
+        Callers must have already persisted whatever the dispatcher should
+        pick up (task status, work-item phase, user input) — the wake is
+        only a scheduling nudge. This is how checkpoint answers reach a
+        live run without starting a second ``_execute_company_mode`` over
+        it (the single-dispatcher-per-run invariant).
+        """
+        clean = str(run_id or "").strip()
+        if not clean or self._live_run_dispatchers.get(clean, 0) <= 0:
+            return False
+        self._signal_dispatcher_wake()
+        return True
+
+    @staticmethod
+    def _delegation_run_id_for_tasks(tasks: list[Task]) -> str:
+        for task in tasks:
+            run_id = str(
+                (getattr(task, "metadata", {}) or {}).get("delegation_run_id", "") or ""
+            ).strip()
+            if run_id:
+                return run_id
+        return ""
+
     async def _execute_multi_team_org(
         self,
         plan: CompanyWorkItemRuntimePlan,
@@ -4589,9 +4622,20 @@ class CompanyWorkItemExecutor:
             CompanyExecutorRunState(active_plan=plan, active_tasks=list(tasks))
         )
         runtime_token = self.runtime.use_state(self.runtime.create_state())
+        run_id = self._delegation_run_id_for_tasks(tasks)
+        if run_id:
+            self._live_run_dispatchers[run_id] = (
+                self._live_run_dispatchers.get(run_id, 0) + 1
+            )
         try:
             return await self._execute_multi_team_org_scoped(plan, tasks)
         finally:
+            if run_id:
+                remaining = self._live_run_dispatchers.get(run_id, 0) - 1
+                if remaining > 0:
+                    self._live_run_dispatchers[run_id] = remaining
+                else:
+                    self._live_run_dispatchers.pop(run_id, None)
             self.runtime.reset_state(runtime_token)
             self._reset_run_state(run_token)
 

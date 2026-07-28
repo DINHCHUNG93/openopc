@@ -79,7 +79,7 @@ from opc.layer2_organization.org_engine import (
     TASK_MODE_COMPANY_ONLY_TOOLS,
 )
 from opc.layer2_organization.task_graph import TaskGraphScheduler
-from opc.layer2_organization.approval import ApprovalEngine
+from opc.layer2_organization.approval import ApprovalEngine, normalize_escalation_reply
 from opc.layer2_organization.escalation import EscalationEngine
 from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
@@ -11137,9 +11137,63 @@ class OPCEngine:
             await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="invalid")
             return "Could not resume the pending task because it no longer exists."
 
-        task.context_snapshot = dict(task.context_snapshot)
-        task.context_snapshot["user_supplied_input"] = user_reply.strip()
+        # Unified approval channel (OBS-7): when the pause was a blocked tool
+        # and the reply is an explicit decision, apply it through the same
+        # engine the Office UI card click uses. Without this bridge the chat
+        # route is input-only: the worker retries the still-blocked command
+        # and re-escalates until the attempt ledger terminalizes the card.
         pause_request = dict(payload.get("pause_request", {}))
+        injected_reply = user_reply.strip()
+        permission_context = dict(pause_request.get("permission_context", {}) or {})
+        blocked_tool_name = str(permission_context.get("tool_name", "") or "").strip()
+        decision_token = normalize_escalation_reply(user_reply)
+        if blocked_tool_name and decision_token and self.approval_engine is not None:
+            arguments: dict[str, Any] = {}
+            raw_args = payload.get("tool_args") or pause_request.get("tool_args") or {}
+            if isinstance(raw_args, dict):
+                arguments = dict(raw_args)
+            candidate = str(permission_context.get("candidate", "") or "").strip()
+            if candidate and not str(arguments.get("command", "") or "").strip():
+                arguments["command"] = candidate
+            try:
+                context = self.approval_engine.escalation_context_for_blocked_tool(
+                    task,
+                    tool_name=blocked_tool_name,
+                    arguments=arguments,
+                )
+                outcome = self.approval_engine.apply_deferred_escalation_decision(
+                    decision_token,
+                    context,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Checkpoint {} approval reply {} failed to apply; degrading to plain input",
+                    checkpoint.checkpoint_id,
+                    decision_token,
+                )
+            else:
+                approved = bool(outcome.get("approved"))
+                logger.info(
+                    "Checkpoint {} approval decision applied via reply: {} -> "
+                    "approved={} scope={} patterns={}",
+                    checkpoint.checkpoint_id,
+                    decision_token,
+                    approved,
+                    outcome.get("scope"),
+                    outcome.get("patterns"),
+                )
+                injected_reply = (
+                    f"Approval decision applied: {decision_token}. The blocked "
+                    f"`{blocked_tool_name}` action is now allowlisted — retry it "
+                    "and continue the task."
+                    if approved
+                    else
+                    f"Approval decision applied: deny. Do not retry the blocked "
+                    f"`{blocked_tool_name}` action; take an alternative approach "
+                    "or report the limitation in your handoff."
+                )
+        task.context_snapshot = dict(task.context_snapshot)
+        task.context_snapshot["user_supplied_input"] = injected_reply
         if pause_request:
             task.context_snapshot["requested_user_input"] = pause_request
         self._restore_runtime_state_from_checkpoint(task, payload)
@@ -11195,6 +11249,26 @@ class OPCEngine:
             # Re-register child tasks so WSHandler can dual-route progress
             # events from child work items to the parent session channel.
             self._reregister_company_runtime_children(tasks, checkpoint_session_id=checkpoint.session_id)
+            # Single-dispatcher-per-run: when the run's dispatcher is live in
+            # this process, the answer is already persisted (task input +
+            # released human wait) — wake the loop and let it claim the work.
+            # Re-entering _execute_company_mode here would overlay a second
+            # dispatcher on the live run: the resume reset cleared live claim
+            # registries and the attempt ledger stamped every in-flight card
+            # as interrupted (project t2 forensics, OBS-4).
+            run_id = str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+            wake = getattr(getattr(self, "company_executor", None), "wake_live_run_dispatcher", None)
+            if run_id and callable(wake) and wake(run_id):
+                logger.info(
+                    "Checkpoint {} answered with live dispatcher for run {}; "
+                    "input delivered in place without re-entry",
+                    checkpoint.checkpoint_id,
+                    run_id,
+                )
+                return (
+                    "Input received. The company runtime is live and will pick "
+                    "it up on its next dispatch tick."
+                )
             plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
             if isinstance(plan_data, dict) and plan_data:
                 return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
@@ -11272,6 +11346,21 @@ class OPCEngine:
         if execution_mode == ExecutionMode.COMPANY_MODE.value:
             # Re-register child tasks for WSHandler dual-routing
             self._reregister_company_runtime_children(tasks, checkpoint_session_id=checkpoint.session_id)
+            # Single-dispatcher-per-run: deliver + wake instead of re-entry
+            # when the run's dispatcher is live (see _resume_task_checkpoint).
+            run_id = str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+            wake = getattr(getattr(self, "company_executor", None), "wake_live_run_dispatcher", None)
+            if run_id and callable(wake) and wake(run_id):
+                logger.info(
+                    "Peer checkpoint {} answered with live dispatcher for run {}; "
+                    "input delivered in place without re-entry",
+                    checkpoint.checkpoint_id,
+                    run_id,
+                )
+                return (
+                    "Input received. The company runtime is live and will pick "
+                    "it up on its next dispatch tick."
+                )
             plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
             if isinstance(plan_data, dict) and plan_data:
                 return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
