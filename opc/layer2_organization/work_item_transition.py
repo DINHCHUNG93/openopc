@@ -179,14 +179,13 @@ async def transition_work_item(
     if release_claim:
         # Fold claim release into the same write as the phase change: the
         # legacy two-call sequence could commit the phase and then fail the
-        # release, stranding a dead claim. Terminal phases additionally drop
-        # the metadata claim mirror keys so the row can never satisfy a
-        # future claim-CAS predicate by accident.
+        # release, stranding a dead claim. The metadata mirror keys are
+        # blanked alongside the columns so the mirror never outlives the
+        # ownership it mirrors.
         kwargs["claimed_by_role_runtime_session_id"] = ""
         kwargs["claimed_by_seat_id"] = ""
-        if phase in DONE_PHASES:
-            merged.setdefault("claimed_by_role_session_id", "")
-            merged.setdefault("claimed_task_id", "")
+        merged.setdefault("claimed_by_role_session_id", "")
+        merged.setdefault("claimed_task_id", "")
     try:
         result = await store.update_delegation_work_item(work_item_id, **kwargs)
     except InvalidPhaseTransition:
@@ -1147,22 +1146,20 @@ async def refresh_dependents_for_run(
                 elif work_item.phase == Phase.RUNNING:
                     target_phase = Phase.WAITING_FOR_CHILDREN
                 metadata_updates["waiting_on_work_item_ids"] = dependency_ids
-            # Clear the parent claim whenever the parent truly leaves
-            # WAITING_FOR_CHILDREN toward a non-terminal phase. The old
-            # condition ("only when all children approved AND target is
-            # RUNNING") left a gap: when a child went READY_FOR_REWORK,
-            # the refresh now fires (per _DEPENDENT_REFRESH_TARGETS) but
-            # the parent stayed in WAITING_FOR_CHILDREN with a stale claim,
-            # so the dispatcher couldn't re-pick it even though the child
-            # was back on the worker's queue.
-            # We exclude DONE_PHASES because for terminal parents the
-            # claim is a historical audit record of "last executor".
+            # Waking a parent out of WAITING_FOR_CHILDREN must orphan it so
+            # the dispatcher can re-pick it. For READY targets the store's
+            # phase-write invariant releases ownership; only the direct
+            # →RUNNING wake still needs the explicit clear (columns and
+            # mirror in the same write). Terminal targets keep the claim as
+            # a historical audit record of "last executor".
             clear_claim_on_wake = (
                 work_item.phase == Phase.WAITING_FOR_CHILDREN
-                and target_phase != work_item.phase
-                and target_phase not in DONE_PHASES
+                and target_phase == Phase.RUNNING
             )
-            if target_phase != work_item.phase or metadata_updates or clear_claim_on_wake:
+            if clear_claim_on_wake:
+                metadata_updates["claimed_by_role_session_id"] = ""
+                metadata_updates["claimed_task_id"] = ""
+            if target_phase != work_item.phase or metadata_updates:
                 try:
                     await store.update_delegation_work_item(
                         work_item.work_item_id,
