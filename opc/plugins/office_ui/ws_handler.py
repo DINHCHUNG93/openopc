@@ -8525,6 +8525,143 @@ class WSHandler:
             logger.opt(exception=True).debug("failed to persist checkpoint card terminal state")
             return None
 
+    _LOCK_FREE_CHECKPOINT_ANSWER_TYPES = frozenset({
+        "task_user_input",
+        "company_work_item_gate",
+    })
+
+    async def _try_lock_free_parked_checkpoint_answer(
+        self,
+        *,
+        task_id: str,
+        content: str,
+        session_id: str | None,
+        message_metadata: dict[str, Any] | None,
+        user_message_id: str | None,
+        user_message_created_at: float | None,
+        engine: Any,
+        pid: str,
+        channel_id: str,
+        session_exec_mode: str,
+        session_company_profile: str | None,
+        session_org_id: str,
+        attachment_refs: list[dict] | None,
+    ) -> bool:
+        """Answer a pending park checkpoint without taking the per-task turn lock.
+
+        A company goal turn can hold the per-task lock for hours while its live
+        dispatcher waits on AWAITING_HUMAN approval cards. The card answers are
+        themselves session messages, so they queue behind that same lock — a
+        circular wait: dispatcher waits for the answer, the answer waits for the
+        lock, the lock waits for the dispatcher (project-0012 late-approval
+        wedge). When the reply explicitly targets a pending park checkpoint and
+        the lock is currently held, deliver it straight through the engine's
+        checkpoint-resume channel instead: with a live dispatcher the engine
+        only persists the input, applies the approval decision, releases the
+        human wait, and wakes the loop — no second dispatcher, no re-entry.
+
+        Returns True when the reply was fully handled here.
+        """
+        metadata = dict(message_metadata or {})
+        checkpoint_id = str(metadata.get("response_to_checkpoint_id", "") or "").strip()
+        checkpoint_type = str(metadata.get("response_to_checkpoint_type", "") or "").strip()
+        if not checkpoint_id or checkpoint_type not in self._LOCK_FREE_CHECKPOINT_ANSWER_TYPES:
+            return False
+        lock = self._get_task_lock(task_id)
+        if not lock.locked():
+            # No turn in flight: the serialized path works and preserves
+            # ordering, so keep the existing behavior.
+            return False
+        store = getattr(engine, "store", None)
+        if not self._store_is_ready(store):
+            return False
+        getter = getattr(store, "get_pending_checkpoints", None)
+        if not callable(getter):
+            return False
+        try:
+            pending = await getter(project_id=pid)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "Lock-free checkpoint answer: failed to load pending checkpoints"
+            )
+            return False
+        checkpoint = next(
+            (
+                item
+                for item in pending or []
+                if str(getattr(item, "checkpoint_id", "") or "").strip() == checkpoint_id
+                and str(getattr(item, "checkpoint_type", "") or "").strip()
+                in self._LOCK_FREE_CHECKPOINT_ANSWER_TYPES
+            ),
+            None,
+        )
+        if checkpoint is None:
+            return False
+        logger.info(
+            f"Lock-free checkpoint answer: task lock for {task_id} is held by a "
+            f"live turn; delivering reply to pending checkpoint {checkpoint_id} "
+            "through the engine resume channel"
+        )
+        try:
+            engine_mode, company_profile = self._resolve_engine_mode(
+                session_exec_mode,
+                session_company_profile,
+            )
+            engine_message_metadata = dict(metadata)
+            engine_message_metadata.update(_ui_message_identity_metadata(
+                message_id=user_message_id,
+                conversation_turn_id=_ui_conversation_turn_id(user_message_id),
+                created_at=user_message_created_at,
+            ))
+            response = await engine.process_message(
+                content,
+                project_id=pid,
+                session_id=session_id,
+                mode=engine_mode,
+                org_id=session_org_id or None,
+                company_profile=company_profile,
+                origin_task_id=task_id,
+                attachment_refs=attachment_refs,
+                message_metadata=engine_message_metadata or None,
+            )
+            updated_checkpoint_msg = await self._mark_checkpoint_card_after_engine_response(
+                channel_id=channel_id,
+                project_id=pid,
+                engine=engine,
+                message_metadata=engine_message_metadata,
+                response_message_id=user_message_id,
+            )
+            if updated_checkpoint_msg is not None:
+                await self.broadcast({"type": "session_message", "payload": updated_checkpoint_msg})
+            reply_text = str(response or "").strip() or "Input received."
+            reply_msg = await self.chat_store.insert_message(
+                channel_id=channel_id,
+                sender="assistant",
+                sender_name="OPC",
+                content=reply_text,
+                project_id=pid,
+                metadata={"type": "system", "checkpoint_answer_lock_free": True},
+            )
+            await self.broadcast({"type": "session_message", "payload": reply_msg})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Do NOT fall back to the locked path: it would silently queue
+            # behind the in-flight turn — exactly the wedge this path exists
+            # to break. Surface the failure so the user can retry.
+            logger.opt(exception=True).warning(
+                f"Lock-free checkpoint answer failed for {checkpoint_id}"
+            )
+            helper = await self.chat_store.insert_message(
+                channel_id=channel_id,
+                sender="system",
+                sender_name="OPC",
+                content=f"Failed to deliver the approval reply: {exc}. Please click the card again.",
+                project_id=pid,
+            )
+            await self.broadcast({"type": "session_message", "payload": helper})
+        return True
+
     async def _process_session_message(
         self, task_id: str, content: str, *,
         session_id: str | None = None,
@@ -8565,6 +8702,23 @@ class WSHandler:
                 session_exec_mode, session_company_profile = self._resolve_task_session_config(task)
                 session_org_id = self._resolve_task_org_id(task)
                 session_preferred_agent = self._resolve_task_preferred_agent(task)
+
+        if await self._try_lock_free_parked_checkpoint_answer(
+            task_id=task_id,
+            content=content,
+            session_id=session_id,
+            message_metadata=message_metadata,
+            user_message_id=user_message_id,
+            user_message_created_at=user_message_created_at,
+            engine=engine,
+            pid=pid,
+            channel_id=channel_id,
+            session_exec_mode=session_exec_mode,
+            session_company_profile=session_company_profile,
+            session_org_id=session_org_id,
+            attachment_refs=attachment_refs,
+        ):
+            return
 
         # Per-task lock: same session serialized, different sessions concurrent
         async with self._get_task_lock(task_id):

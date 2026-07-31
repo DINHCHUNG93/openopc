@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import os
 import re
 import shutil
 import time
@@ -639,9 +640,21 @@ class OPCEngine:
         self.org_engine = OrgEngine(self.config, self.opc_home, store=self.store)
         self.talent_market = TalentMarket(self.opc_home, self.config)
         self.task_scheduler = TaskGraphScheduler(self.store, self.event_bus)
+        escalation_timeout_seconds = self.config.system.escalation_timeout_seconds
+        # Test/ops override: lets a harness shrink the inline approval wait
+        # (e.g. to seconds) so the late-click park/resume cycle can be
+        # exercised without waiting out the production timeout.
+        raw_escalation_timeout = str(os.environ.get("OPC_ESCALATION_TIMEOUT_SECONDS", "") or "").strip()
+        if raw_escalation_timeout:
+            try:
+                escalation_timeout_seconds = max(1, int(raw_escalation_timeout))
+            except ValueError:
+                logger.warning(
+                    f"Ignoring invalid OPC_ESCALATION_TIMEOUT_SECONDS={raw_escalation_timeout!r}"
+                )
         self.escalation = EscalationEngine(
             self.event_bus,
-            timeout_seconds=self.config.system.escalation_timeout_seconds,
+            timeout_seconds=escalation_timeout_seconds,
             user_reply_callback=self.on_escalation,
         )
         self.communication = CommunicationManager(self.store, self.event_bus, self.llm, self.org_engine)
@@ -4303,9 +4316,17 @@ class OPCEngine:
                     "created_at": latest_compaction.created_at.isoformat(),
                 })
 
-        permission_requests: list[dict[str, Any]] = []
+        # Preserve any permission_requests already recorded on the payload —
+        # they carry the blocked call's tool_args, which are the only source
+        # of the command text for a late allowlist grant. Rebuilding from the
+        # legacy approval/pause_request keys is a fallback, not a replacement.
+        permission_requests: list[dict[str, Any]] = [
+            dict(item)
+            for item in list(payload_data.get("permission_requests", []) or [])
+            if isinstance(item, dict)
+        ]
         approval = dict(payload_data.get("approval", {}) or {})
-        if approval:
+        if approval and not permission_requests:
             permission_requests.append({
                 "tool_name": str(payload_data.get("tool_name", "") or ""),
                 "resolution": "ask",
@@ -11357,10 +11378,36 @@ class OPCEngine:
         injected_reply = user_reply.strip()
         permission_context = dict(pause_request.get("permission_context", {}) or {})
         blocked_tool_name = str(permission_context.get("tool_name", "") or "").strip()
+        blocked_tool_args: dict[str, Any] = {}
+        if not blocked_tool_name:
+            # Company runtime parks persist the blocked call as a
+            # permission_requests entry (runtime_v2 artifacts), not as
+            # pause_request.permission_context. Without this fallback a late
+            # approval reply resumes the task but records no allowlist grant,
+            # so the identical command re-blocks and re-parks on a fresh card
+            # every cycle (the project-0012 approve treadmill).
+            for request in reversed(list(payload.get("permission_requests", []) or [])):
+                if not isinstance(request, dict):
+                    continue
+                if str(request.get("resolution", "") or "").strip() != "ask":
+                    continue
+                candidate_tool = str(request.get("tool_name", "") or "").strip()
+                if not candidate_tool:
+                    continue
+                blocked_tool_name = candidate_tool
+                raw_request_args = request.get("tool_args")
+                if isinstance(raw_request_args, dict):
+                    blocked_tool_args = dict(raw_request_args)
+                break
         decision_token = normalize_escalation_reply(user_reply)
         if blocked_tool_name and decision_token and self.approval_engine is not None:
             arguments: dict[str, Any] = {}
-            raw_args = payload.get("tool_args") or pause_request.get("tool_args") or {}
+            raw_args = (
+                payload.get("tool_args")
+                or pause_request.get("tool_args")
+                or blocked_tool_args
+                or {}
+            )
             if isinstance(raw_args, dict):
                 arguments = dict(raw_args)
             candidate = str(permission_context.get("candidate", "") or "").strip()

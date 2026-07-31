@@ -136,6 +136,68 @@ class CheckpointAnswerLiveDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("shell_exec", injected)
         self.assertEqual(saved.status, TaskStatus.PENDING)
 
+    async def test_runtime_v2_park_shape_applies_approval_via_permission_requests(self) -> None:
+        """Company runtime parks carry the blocked call in permission_requests
+        (empty pause_request). The decision bridge must fall back to that shape
+        or a late approval resumes without recording any allowlist grant and
+        the identical command re-parks forever (project-0012 treadmill)."""
+        checkpoint = await self._seed()
+        payload = dict(checkpoint.payload)
+        payload["pause_request"] = {}
+        payload["permission_requests"] = [
+            {
+                "tool_name": "shell_exec",
+                "tool_args": {"command": "pip install pandas"},
+                "resolution": "ask",
+                "scope": "once",
+                "risk_level": "medium",
+                "rationale": "Command is not in the low-risk allowlist.",
+                "source": "approval_engine",
+            }
+        ]
+        checkpoint.payload = payload
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.executor._live_run_dispatchers["run-1"] = 1
+
+        reply = await self.engine._resume_task_checkpoint(checkpoint, "approve_session")
+
+        self.assertIn("live", reply)
+        saved = await self.store.get_task("task-1")
+        injected = str(saved.context_snapshot.get("user_supplied_input", ""))
+        self.assertIn("Approval decision applied", injected)
+        self.assertIn("shell_exec", injected)
+
+    async def test_permission_requests_artifact_preserves_tool_args(self) -> None:
+        """The runtime park artifact must persist the blocked call's arguments;
+        they are the only source of the command text for late allowlist grants."""
+        from opc.layer3_agent.runtime_v2.runtime import NativeRuntimeV2
+
+        class _Decision:
+            resolution = type("R", (), {"value": "ask"})()
+            scope = type("S", (), {"value": "once"})()
+            risk_level = type("L", (), {"value": "medium"})()
+            rationale = "blocked"
+            source = "approval_engine"
+
+        runtime = object.__new__(NativeRuntimeV2)
+        requests = NativeRuntimeV2._permission_requests_from_results(
+            runtime,
+            [
+                {
+                    "permission_decision": _Decision(),
+                    "tool_call": {
+                        "function": "shell_exec",
+                        "arguments": {"command": "curl -sI https://example.com"},
+                    },
+                }
+            ],
+        )
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["tool_name"], "shell_exec")
+        self.assertEqual(
+            requests[0]["tool_args"], {"command": "curl -sI https://example.com"}
+        )
+
     async def test_no_live_dispatcher_falls_through_to_reentry_path(self) -> None:
         checkpoint = await self._seed()
 

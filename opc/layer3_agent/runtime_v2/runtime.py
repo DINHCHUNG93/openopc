@@ -4029,8 +4029,15 @@ class NativeRuntimeV2:
             resolution_value = getattr(resolution, "value", str(resolution))
             if resolution_value not in {"ask", "deny"}:
                 continue
+            raw_arguments = call.get("arguments")
             requests.append({
                 "tool_name": str(call.get("function", "") or ""),
+                # The blocked call's arguments must survive into the park
+                # checkpoint: a late approval reply rebuilds the allowlist
+                # context from them, and without the command text no grant can
+                # be recorded — the task resumes, retries, re-blocks, and
+                # re-parks on an identical card forever.
+                "tool_args": dict(raw_arguments) if isinstance(raw_arguments, dict) else {},
                 "resolution": resolution_value,
                 "scope": getattr(getattr(decision, "scope", None), "value", str(getattr(decision, "scope", ""))),
                 "risk_level": getattr(getattr(decision, "risk_level", None), "value", str(getattr(decision, "risk_level", ""))),
