@@ -1156,11 +1156,14 @@ class CompanyRuntime:
             review_tag = f"review-task::{task.id}"
             if task.id in queue or review_tag in queue:
                 continue
-            # Kanban-push review tasks take priority over regular work so a
-            # manager role always clears its review backlog before dispatching
-            # or executing its own work.
+            # Review tasks still preempt regular work — that priority is
+            # enforced at pop time (`_pop_next_queue_entry` pulls the first
+            # review entry anywhere in the queue). Appending here keeps
+            # reviews in arrival order among themselves; prepending would
+            # invert a review backlog to newest-first and starve the oldest
+            # submission while newer reviews keep jumping ahead.
             if bool((task.metadata or {}).get("review_task", False)):
-                queue.appendleft(review_tag)
+                queue.append(review_tag)
             else:
                 queue.append(task.id)
 
@@ -1211,8 +1214,11 @@ class CompanyRuntime:
             review_tag = f"review-work-item::{work_item_id}"
             if work_tag in queue or review_tag in queue:
                 continue
+            # Same ordering contract as enqueue_runnable_tasks: review
+            # priority lives in `_pop_next_queue_entry`, so reviews are
+            # appended to preserve FIFO among a review backlog.
             if is_review_execution_work_item_metadata(metadata):
-                queue.appendleft(review_tag)
+                queue.append(review_tag)
             else:
                 queue.append(work_tag)
 
