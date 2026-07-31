@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 import shutil
 from pathlib import Path
@@ -128,9 +127,15 @@ class CursorAdapter(ExternalAgentAdapter):
             root = Path(".").resolve()
         prompt_dir = root / ".opc" / "external_prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
+        # Self-ignoring directory: agents run `git add` in the workspace and
+        # must never commit spilled prompts.
+        gitignore_path = prompt_dir / ".gitignore"
+        if not gitignore_path.exists():
+            gitignore_path.write_text("*\n", encoding="utf-8")
         task_id = str(getattr(task, "id", "") or "").strip() or "task"
-        digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
-        prompt_path = prompt_dir / f"cursor_{task_id}_{digest}.md"
+        # One stable file per task: retries and resumes overwrite instead of
+        # accumulating a new file per prompt revision.
+        prompt_path = prompt_dir / f"cursor_{task_id}.md"
         prompt_path.write_text(prompt_text, encoding="utf-8")
         pointer = (
             "Open and follow the complete task instructions in this file exactly:\n"

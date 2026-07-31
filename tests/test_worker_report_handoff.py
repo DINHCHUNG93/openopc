@@ -13,7 +13,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from opc.core.config import OPCConfig, RoleConfig
 from opc.core.events import EventBus
@@ -1503,6 +1503,39 @@ class ReportFailureStormBrakeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         refreshed = await self.store.get_delegation_work_item("wi-child")
+        self.assertEqual(refreshed.phase, Phase.FAILED)
+        self.assertIn("report_chain_failure", str(refreshed.blocked_reason or ""))
+        self.assertFalse(
+            str((refreshed.metadata or {}).get("report_chain_hold", "") or "").strip()
+        )
+
+    async def test_terminalize_write_failure_quarantines_via_hold(self) -> None:
+        parent = _build_child_work_item()
+        parent.phase = Phase.AWAITING_MANAGER_REVIEW
+        parent.metadata = {
+            **dict(parent.metadata or {}),
+            "review_owner_role_id": "cto",
+            "review_owner_seat_id": "seat::team::cto::cto",
+            "max_consecutive_report_failures": 3,
+        }
+        await self.store.save_delegation_work_item(parent)
+        for attempt in (1, 2, 3):
+            await self.store.save_delegation_work_item(self._failed_report(attempt))
+
+        with patch(
+            "opc.layer2_organization.company_mode.transition_work_item",
+            side_effect=RuntimeError("db write lost"),
+        ):
+            await self.executor._reconcile_missing_review_chain(
+                await self.store.list_delegation_work_items("run-1")
+            )
+        self.assertIsNone(
+            await self.store.get_delegation_work_item(
+                report_work_item_id_for_attempt("wi-child", 4)
+            )
+        )
+        refreshed = await self.store.get_delegation_work_item("wi-child")
+        self.assertEqual(refreshed.phase, Phase.AWAITING_MANAGER_REVIEW)
         self.assertEqual(
             refreshed.metadata.get("report_chain_hold"),
             "consecutive_report_failures",

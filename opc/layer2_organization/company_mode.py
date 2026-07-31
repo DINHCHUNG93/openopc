@@ -6890,7 +6890,18 @@ class CompanyWorkItemExecutor:
         *,
         work_items: list[DelegationWorkItem] | None = None,
     ) -> bool:
-        """True when reconcile must stop minting new report cards for parent."""
+        """True when reconcile must stop minting new report cards for parent.
+
+        Over the failure limit the parent is terminalized to FAILED so the
+        normal settlement machinery (dependents refresh, manager visibility,
+        rework/resume) takes over — a parent parked in
+        AWAITING_MANAGER_REVIEW with no spawnable report card can never
+        advance on its own. The ``report_chain_hold`` stamp survives only as
+        the quarantine fallback when even the FAILED write does not land,
+        mirroring the attempt ledger's terminalize pattern.
+        """
+        if getattr(parent_item, "phase", None) in DONE_PHASES:
+            return True
         parent_metadata = dict(getattr(parent_item, "metadata", {}) or {})
         if str(parent_metadata.get("report_chain_hold", "") or "").strip():
             return True
@@ -6908,31 +6919,75 @@ class CompanyWorkItemExecutor:
         limit = self._report_failure_limit(parent_item)
         if consecutive_failures < limit:
             return False
-        hold_reason = (
-            f"{consecutive_failures} consecutive report cards failed "
-            f"(limit {limit}); refusing to spawn another Report #N until "
-            "the parent leaves AWAITING_MANAGER_REVIEW or the hold is cleared"
+        block_reason = (
+            f"report_chain_failure: {consecutive_failures} consecutive report "
+            f"cards failed (limit {limit})"
+        )
+        summary_text = (
+            "Work item failed because its report handoff pipeline is broken: "
+            f"{consecutive_failures} consecutive report cards died before a "
+            f"durable report landed (limit {limit}). The execution result is "
+            "preserved on the card; rework retries the handoff."
         )
         try:
-            await self.store.update_delegation_work_item(
+            await transition_work_item(
+                self.store,
                 parent_item.work_item_id,
+                target_phase=Phase.FAILED,
+                reason="report_chain_failure",
+                summary=summary_text,
                 metadata_updates={
-                    "report_chain_hold": "consecutive_report_failures",
-                    "report_chain_hold_reason": hold_reason,
-                    "report_chain_hold_at": datetime.now().isoformat(),
                     "report_chain_failed_attempts": consecutive_failures,
                 },
+                release_claim=True,
+            )
+            try:
+                await self.store.update_delegation_work_item(
+                    parent_item.work_item_id,
+                    blocked_reason=block_reason,
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "report_chain_failure blocked_reason write failed for {}",
+                    parent_item.work_item_id,
+                )
+            await self._emit_progress(
+                f"[Company:{projection_id_for_work_item(parent_item)}] {summary_text}"
+            )
+        except InvalidPhaseTransition:
+            # A concurrent writer moved the parent (e.g. a racing manager
+            # approval). Skip minting this tick; the next reconcile pass
+            # re-evaluates from the fresh phase.
+            logger.opt(exception=True).debug(
+                "report_chain_failure terminalize lost a phase race for {}",
+                parent_item.work_item_id,
             )
         except Exception:
             logger.opt(exception=True).warning(
-                "Failed to stamp report_chain_hold on "
-                f"work_item_id={parent_item.work_item_id}"
+                "report_chain_failure FAILED terminalize did not land for {}; "
+                "quarantining via report_chain_hold",
+                parent_item.work_item_id,
             )
+            try:
+                await self.store.update_delegation_work_item(
+                    parent_item.work_item_id,
+                    metadata_updates={
+                        "report_chain_hold": "consecutive_report_failures",
+                        "report_chain_hold_reason": block_reason,
+                        "report_chain_hold_at": datetime.now().isoformat(),
+                        "report_chain_failed_attempts": consecutive_failures,
+                    },
+                )
+            except Exception:
+                logger.opt(exception=True).error(
+                    "report_chain_hold quarantine write also failed for {}",
+                    parent_item.work_item_id,
+                )
         await self._record_work_item_runtime_diagnostic(
-            code="report_chain_held_after_failures",
+            code="report_chain_failure_terminalized",
             severity="error",
             work_item=parent_item,
-            message=hold_reason,
+            message=summary_text,
             details={
                 "consecutive_failures": consecutive_failures,
                 "limit": limit,

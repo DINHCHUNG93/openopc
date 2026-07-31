@@ -3612,6 +3612,17 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(str(prompt_file), str(cmd[-1]))
             self.assertNotIn(prompt[:64], metadata["command"])
             self.assertLess(len(cmd[-1].encode("utf-8")), CursorAdapter._ARGV_PROMPT_MAX_BYTES)
+            # Hygiene: one stable file per task (retries overwrite) and a
+            # self-ignoring directory so workspace git never picks it up.
+            self.assertEqual(prompt_file.name, "cursor_task-large.md")
+            _cmd2, metadata2 = adapter.build_interactive_invocation(
+                task, workspace_path=tmpdir
+            )
+            self.assertEqual(metadata2["prompt_file"], str(prompt_file))
+            self.assertEqual(
+                sorted(p.name for p in prompt_file.parent.iterdir()),
+                [".gitignore", "cursor_task-large.md"],
+            )
         finally:
             _cleanup_test_dir(tmpdir)
 
