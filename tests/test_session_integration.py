@@ -1998,6 +1998,115 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertIn("company_session_reopened_at", refreshed.metadata)
         self.engine.process_message.assert_called_once()
 
+    async def test_process_session_message_uses_durable_org_for_role_task(self) -> None:
+        runtime_session_id = "runtime-org-session"
+        anchor = await self.store.get_task(self.task_id)
+        assert anchor is not None
+        anchor.session_id = runtime_session_id
+        anchor.metadata = {
+            "exec_mode": "org",
+            "mode": "company",
+            "company_profile": "custom",
+            "org_id": "vc-investment-firm",
+        }
+        await self.store.save_task(anchor)
+
+        role_task = Task(
+            id="role-task-without-org-id",
+            title="Sector Analyst",
+            project_id="test-project",
+            session_id=f"{runtime_session_id}:role:sector-analyst",
+            parent_session_id=runtime_session_id,
+            metadata={
+                "exec_mode": "org",
+                "mode": "company",
+                "company_profile": "custom",
+                "shared_role_session": True,
+                "shared_role_id": "sector_analyst",
+                "company_runtime_root_session_id": runtime_session_id,
+            },
+        )
+        await self.store.save_task(role_task)
+        self.handler.services_context.get_active_saved_org_name = AsyncMock(
+            return_value="wrong-active-org"
+        )
+
+        await self.handler._process_session_message(
+            role_task.id,
+            "approve",
+            session_id=role_task.session_id,
+        )
+
+        self.engine.process_message.assert_called_once()
+        call_kwargs = self.engine.process_message.call_args.kwargs
+        self.assertEqual(call_kwargs["mode"], "org")
+        self.assertEqual(call_kwargs["company_profile"], "custom")
+        self.assertEqual(call_kwargs["org_id"], "vc-investment-firm")
+
+    async def test_lock_free_process_session_message_uses_durable_org_for_role_task(self) -> None:
+        runtime_session_id = "runtime-org-lock-free-session"
+        anchor = await self.store.get_task(self.task_id)
+        assert anchor is not None
+        anchor.session_id = runtime_session_id
+        anchor.metadata = {
+            "exec_mode": "org",
+            "mode": "company",
+            "company_profile": "custom",
+            "org_id": "vc-investment-firm",
+        }
+        await self.store.save_task(anchor)
+
+        role_task = Task(
+            id="role-task-lock-free-without-org-id",
+            title="Sector Analyst",
+            project_id="test-project",
+            session_id=f"{runtime_session_id}:role:sector-analyst",
+            parent_session_id=runtime_session_id,
+            metadata={
+                "exec_mode": "org",
+                "mode": "company",
+                "company_profile": "custom",
+                "shared_role_session": True,
+                "shared_role_id": "sector_analyst",
+                "company_runtime_root_session_id": runtime_session_id,
+            },
+        )
+        await self.store.save_task(role_task)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="org-lock-free-gate",
+            project_id="test-project",
+            session_id=runtime_session_id,
+            checkpoint_type="company_work_item_gate",
+            status="pending",
+            task_id=role_task.id,
+        )
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.engine._load_execution_checkpoint_by_id = AsyncMock(return_value=checkpoint)
+        self.handler.services_context.get_active_saved_org_name = AsyncMock(
+            return_value="wrong-active-org"
+        )
+
+        lock = self.handler._get_task_lock(role_task.id)
+        await lock.acquire()
+        try:
+            await self.handler._process_session_message(
+                role_task.id,
+                "approve",
+                session_id=role_task.session_id,
+                message_metadata={
+                    "response_to_checkpoint_id": checkpoint.checkpoint_id,
+                    "response_to_checkpoint_type": checkpoint.checkpoint_type,
+                },
+            )
+        finally:
+            lock.release()
+
+        self.engine.process_message.assert_called_once()
+        call_kwargs = self.engine.process_message.call_args.kwargs
+        self.assertEqual(call_kwargs["mode"], "org")
+        self.assertEqual(call_kwargs["company_profile"], "custom")
+        self.assertEqual(call_kwargs["org_id"], "vc-investment-firm")
+
     async def test_session_send_reuses_task_session_without_is_ready_flag(self) -> None:
         """Session replies should reuse the task session even for simple stub stores."""
         ws = MagicMock()
