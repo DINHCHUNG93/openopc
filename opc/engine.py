@@ -3564,6 +3564,33 @@ class OPCEngine:
         return bool(dict(getattr(task, "metadata", {}) or {}).get("shared_role_session", False))
 
     @staticmethod
+    def _runtime_org_id_for_identity(
+        decision: RouterDecision | None,
+        metadata: dict[str, Any] | None,
+        org_config: Any | None,
+    ) -> str | None:
+        """Return the durable custom-org ID for a company runtime task."""
+        task_metadata = dict(metadata or {})
+        profile = str(
+            getattr(decision, "company_profile", "")
+            or task_metadata.get("company_profile", "")
+            or getattr(org_config, "company_profile", "")
+            or ""
+        ).strip().lower()
+        if profile != "custom":
+            return None
+        for candidate in (
+            getattr(decision, "org_id", None),
+            task_metadata.get("org_id"),
+            task_metadata.get("organization_id"),
+            getattr(org_config, "organization_id", None),
+        ):
+            normalized = str(candidate or "").strip()
+            if normalized:
+                return normalized
+        return None
+
+    @staticmethod
     def _shared_company_role_session_id(
         parent_session_id: str,
         role_id: str,
@@ -3601,6 +3628,11 @@ class OPCEngine:
         root_session: bool = False,
     ) -> Task:
         assert self.store and self.memory
+        runtime_org_id = self._runtime_org_id_for_identity(
+            decision,
+            getattr(work_item, "metadata", None),
+            getattr(getattr(self, "config", None), "org", None),
+        )
         role_id = str(work_item.role_id or "").strip()
         seat_id = str((work_item.metadata or {}).get("seat_id", "") or "").strip()
         team_id = str((work_item.metadata or {}).get("team_id", "") or work_item.cell_id or "").strip()
@@ -3653,6 +3685,10 @@ class OPCEngine:
             set_linked_work_item_id(existing, work_item.work_item_id)
             existing.session_id = session_id
             existing.metadata = dict(existing.metadata or {})
+            if runtime_org_id:
+                existing.org_id = runtime_org_id
+                existing.metadata["org_id"] = runtime_org_id
+                existing.metadata["organization_id"] = runtime_org_id
             existing.metadata["shared_role_session"] = True
             existing.metadata["shared_role_id"] = role_id
             existing.metadata["company_runtime_root_session_id"] = parent_session_id
@@ -3744,6 +3780,24 @@ class OPCEngine:
         owner_execution_copy = build_work_item_owner_execution_copy(work_item)
         owner_execution_copy.setdefault("delegation_role_session_id", role_session_id)
         owner_execution_copy["work_kind"] = work_item_turn_type
+        runtime_company_profile = str(
+            getattr(decision, "company_profile", "")
+            or (work_item.metadata or {}).get("company_profile", "")
+            or getattr(getattr(self.config, "org", None), "company_profile", "")
+            or ""
+        ).strip().lower()
+        runtime_identity_metadata = (
+            {
+                "org_id": runtime_org_id or "",
+                "organization_id": runtime_org_id or "",
+            }
+            if runtime_company_profile == "custom"
+            else {
+                "organization_id": str(
+                    getattr(getattr(self.config, "org", None), "organization_id", "") or ""
+                ).strip(),
+            }
+        )
         task = Task(
             title=str(work_item.title or work_item_projection_ref or "Runtime Work Item").strip(),
             description=(
@@ -3757,6 +3811,7 @@ class OPCEngine:
             session_id=session_id,
             parent_session_id=parent_session_id,
             assigned_external_agent=assigned_external_agent,
+            org_id=runtime_org_id,
             metadata=mark_work_item_projection(mark_work_item_runtime({
                 "mode": "company",
                 "execution_mode": decision.mode.value,
@@ -3765,7 +3820,6 @@ class OPCEngine:
                 "original_message": original_message,
                 "router_preferred_agent": decision.preferred_agent,
                 "company_profile": decision.company_profile or getattr(self.config.org, "company_profile", "corporate"),
-                "organization_id": getattr(self.config.org, "organization_id", ""),
                 "organization_name": getattr(self.config.org, "organization_name", ""),
                 "organization_config_file": getattr(self.config.org, "organization_config_file", ""),
                 "delegation_playbook": dict(delegation_playbook),
@@ -3780,6 +3834,7 @@ class OPCEngine:
                 ),
                 "runtime_topology": copy.deepcopy(runtime_topology),
                 **owner_execution_copy,
+                **runtime_identity_metadata,
                 "work_item_projection_ref": work_item_projection_ref,
                 "seat_manager_role_id": str(topology_seat.get("manager_role_id", "") or "").strip(),
                 "manager_role_id": str(topology_seat.get("manager_role_id", "") or "").strip(),

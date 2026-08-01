@@ -49,11 +49,20 @@ class _EngineStub:
         return self.reply
 
 
-def _pending_checkpoint(checkpoint_id: str, checkpoint_type: str = "task_user_input") -> Any:
+def _pending_checkpoint(
+    checkpoint_id: str,
+    checkpoint_type: str = "task_user_input",
+    *,
+    task_id: str = "chat-task",
+    session_id: str = "session-1",
+) -> Any:
     return SimpleNamespace(
         checkpoint_id=checkpoint_id,
         checkpoint_type=checkpoint_type,
         status="pending",
+        task_id=task_id,
+        session_id=session_id,
+        payload={"task_ids": [task_id], "waiting_task_id": task_id, "session_id": session_id},
     )
 
 
@@ -182,6 +191,30 @@ class LockFreeCheckpointAnswerTests(unittest.IsolatedAsyncioTestCase):
                         "response_to_checkpoint_type": "company_delivery_feedback",
                     }
                 ),
+            )
+            self.assertFalse(handled)
+            self.assertEqual(engine.calls, [])
+        finally:
+            holder.release_event.set()  # type: ignore[attr-defined]
+            await holder
+
+    async def test_lock_free_requires_exact_checkpoint_type_and_owner(self) -> None:
+        engine = _EngineStub(
+            _StoreStub([
+                _pending_checkpoint(
+                    "ckpt-park",
+                    "company_work_item_gate",
+                    task_id="other-task",
+                    session_id="other-session",
+                )
+            ])
+        )
+        handler = _make_handler(engine)
+        holder = await self._hold_lock(handler, "chat-task")
+        try:
+            handled = await handler._try_lock_free_parked_checkpoint_answer(
+                engine=engine,
+                **_answer_kwargs(),
             )
             self.assertFalse(handled)
             self.assertEqual(engine.calls, [])

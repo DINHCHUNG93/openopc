@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from opc.core.config import validate_organization_id
+from opc.layer2_organization.company_runtime_identity import is_company_runtime_task
 
 PREFERRED_AGENTS: frozenset[str] = frozenset({
     "native",
@@ -154,11 +155,12 @@ def execution_identity_from_task(
     company_profile = metadata.get("company_profile")
     metadata_profile = str(company_profile or "").strip().lower()
     metadata_org_id = (
-        metadata.get("org_id")
+        getattr(task, "org_id", None)
+        or metadata.get("org_id")
         or metadata.get("organization_id")
-        or getattr(task, "org_id", None)
         or ""
     )
+    mode_hint = str(metadata.get("mode", "") or "").strip().lower()
 
     if raw_exec_mode:
         exec_mode = raw_exec_mode
@@ -168,6 +170,15 @@ def execution_identity_from_task(
         explicit = True
     elif execution_mode == "company_mode" or metadata_profile:
         exec_mode = "company"
+        explicit = True
+    elif (
+        mode_hint in {"company", "org", "custom"}
+        or is_company_runtime_task(task)
+    ):
+        # Older company/runtime rows may only retain a mode marker or the
+        # runtime marker itself.  Treat those rows as explicit company
+        # identity so they cannot fall through to task-mode/global defaults.
+        exec_mode = "org" if metadata_org_id else "company"
         explicit = True
     elif metadata_org_id:
         exec_mode = "org"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 from opc.plugins.office_ui.services.context import OfficeServiceContext
 from opc.plugins.office_ui.services.models import ServiceError
@@ -40,7 +41,7 @@ def _context(*, hook: Any | None = None) -> OfficeServiceContext:
     return context
 
 
-class TestPersistSessionConfigOrgFallback(unittest.IsolatedAsyncioTestCase):
+class TestPersistSessionConfigOrgIdentity(unittest.IsolatedAsyncioTestCase):
     async def _persist(
         self,
         context: OfficeServiceContext,
@@ -58,26 +59,20 @@ class TestPersistSessionConfigOrgFallback(unittest.IsolatedAsyncioTestCase):
             org_id=org_id,
         )
 
-    async def test_falls_back_to_active_saved_org_when_task_lacks_org_id(self) -> None:
-        async def active_org() -> str:
-            return "vc-investment-firm"
-
+    async def test_rejects_missing_org_id_without_active_org_fallback(self) -> None:
+        active_org = AsyncMock(return_value="vc-investment-firm")
         context = _context(hook=active_org)
         task = _task()
 
-        await self._persist(context, task)
+        with self.assertRaises(ServiceError) as ctx:
+            await self._persist(context, task)
 
-        assert task.metadata["org_id"] == "vc-investment-firm"
-        assert task.metadata["organization_id"] == "vc-investment-firm"
-        assert task.org_id == "vc-investment-firm"
-        assert task.metadata["exec_mode"] == "org"
-        assert task.metadata["company_profile"] == "custom"
-        assert context.engine.store.saved == [task]
+        assert ctx.exception.code == "org_id_required"
+        active_org.assert_not_awaited()
+        assert context.engine.store.saved == []
 
     async def test_explicit_org_id_still_used_when_present(self) -> None:
-        async def active_org() -> str:
-            return "other-org"
-
+        active_org = AsyncMock(return_value="other-org")
         context = _context(hook=active_org)
         task = _task()
 
@@ -85,17 +80,17 @@ class TestPersistSessionConfigOrgFallback(unittest.IsolatedAsyncioTestCase):
 
         assert task.metadata["org_id"] == "vc-investment-firm"
         assert task.org_id == "vc-investment-firm"
+        active_org.assert_not_awaited()
 
     async def test_raises_when_no_active_org_available(self) -> None:
-        async def empty_org() -> str:
-            return ""
-
+        empty_org = AsyncMock(return_value="")
         context = _context(hook=empty_org)
         task = _task()
 
         with self.assertRaises(ServiceError) as ctx:
             await self._persist(context, task)
         assert ctx.exception.code == "org_id_required"
+        empty_org.assert_not_awaited()
 
     async def test_raises_when_hook_unset(self) -> None:
         context = _context()
@@ -106,15 +101,14 @@ class TestPersistSessionConfigOrgFallback(unittest.IsolatedAsyncioTestCase):
         assert ctx.exception.code == "org_id_required"
 
     async def test_raises_when_hook_fails(self) -> None:
-        async def broken() -> str:
-            raise RuntimeError("org index unreadable")
-
+        broken = AsyncMock(side_effect=RuntimeError("org index unreadable"))
         context = _context(hook=broken)
         task = _task()
 
         with self.assertRaises(ServiceError) as ctx:
             await self._persist(context, task)
         assert ctx.exception.code == "org_id_required"
+        broken.assert_not_awaited()
 
     async def test_company_mode_clears_org_fields_without_fallback(self) -> None:
         fallback_called = False

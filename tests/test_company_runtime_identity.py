@@ -260,6 +260,63 @@ def test_work_item_chat_resume_uses_canonical_ui_anchor_as_engine_origin() -> No
     asyncio.run(scenario())
 
 
+def test_suspend_reply_missing_custom_org_id_fails_closed_before_engine_call() -> None:
+    async def scenario() -> None:
+        _tasks, checkpoint = _runtime_records()
+        handler = WSHandler.__new__(WSHandler)
+        handler._exec_mode = "task"
+        handler._company_profile = "corporate"
+        handler._shutting_down = False
+        handler.chat_store = None
+        handler._company_suspend_reply_locks = {
+            "runtime-session": asyncio.Lock(),
+        }
+        handler._task_bg_context = {}
+        handler._active_runtime_children = {}
+        handler._session_to_task = {}
+        handler._set_company_runtime_control = AsyncMock()
+        handler._normalize_session_exec_mode = MagicMock(return_value="task")
+        handler._normalize_session_company_profile = MagicMock(return_value="corporate")
+        handler._resolve_task_session_config = MagicMock(return_value=("org", "custom"))
+        handler._resolve_task_org_id = MagicMock(return_value="")
+        handler._extract_checkpoint_metadata = AsyncMock(return_value=None)
+        handler._sync_task_transcript_messages = AsyncMock()
+        handler.on_kanban_changed = AsyncMock()
+        handler._flush_progress = AsyncMock()
+        run_engine = SimpleNamespace(
+            project_id="project-a",
+            process_message=AsyncMock(),
+        )
+        config_task = SimpleNamespace(
+            metadata={"exec_mode": "org", "company_profile": "custom"},
+            org_id=None,
+        )
+        target = {
+            "ui_anchor_task_id": "ui-anchor",
+            "config_task": config_task,
+        }
+
+        await handler._process_company_suspend_reply(
+            ui_task_id="final-decider",
+            runtime_session_id="runtime-session",
+            content="continue",
+            attachment_refs=None,
+            message_metadata=None,
+            user_message_id=None,
+            user_message_created_at=None,
+            run_engine=run_engine,
+            run_project_id="project-a",
+            target=target,
+            checkpoint=checkpoint,
+            lock=handler._company_suspend_reply_locks["runtime-session"],
+        )
+
+        run_engine.process_message.assert_not_awaited()
+        handler._set_company_runtime_control.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
 def test_delivery_feedback_rejects_missing_canonical_identity_without_first_task_fallback() -> None:
     async def scenario() -> None:
         tasks, checkpoint = _runtime_records()
