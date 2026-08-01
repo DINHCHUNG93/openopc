@@ -619,6 +619,25 @@ class SessionService:
             explicit_exec_mode=True,
         )
         if identity.is_custom_org and not identity.org_id:
+            # Role-task rows may lack org_id; mirror create()'s active-org fallback
+            fallback_org_id = ""
+            if self.context.get_active_saved_org_name is not None:
+                try:
+                    fallback_org_id = await self.context.get_active_saved_org_name()
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "persist_session_config: failed to resolve active saved org"
+                    )
+            if fallback_org_id:
+                identity = canonicalize_execution_identity(
+                    exec_mode=exec_mode,
+                    company_profile=company_profile,
+                    preferred_agent=preferred_agent,
+                    org_id=fallback_org_id,
+                    default_preferred_agent=self.context.mode_state.task_preferred_agent,
+                    explicit_exec_mode=True,
+                )
+        if identity.is_custom_org and not identity.org_id:
             raise ServiceError("org_id_required", "org_id_required", {
                 "task_id": str(getattr(task, "id", "") or ""),
             })
