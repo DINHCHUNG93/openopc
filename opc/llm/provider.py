@@ -569,6 +569,8 @@ class LLMProvider:
             "max_tokens": max_tok,
             **kwargs,
         }
+        if self.config.reasoning_effort and "reasoning_effort" not in call_kwargs:
+            call_kwargs["reasoning_effort"] = self.config.reasoning_effort
         if self._api_base:
             call_kwargs["api_base"] = self._api_base
         if self._api_key:
@@ -715,6 +717,8 @@ class LLMProvider:
             "stream": True,
             **kwargs,
         }
+        if self.config.reasoning_effort and "reasoning_effort" not in call_kwargs:
+            call_kwargs["reasoning_effort"] = self.config.reasoning_effort
         if self._api_base:
             call_kwargs["api_base"] = self._api_base
         if self._api_key:
