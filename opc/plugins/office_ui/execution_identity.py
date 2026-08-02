@@ -14,7 +14,7 @@ for that identity:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from opc.core.config import validate_organization_id
 from opc.layer2_organization.company_runtime_identity import is_company_runtime_task
@@ -198,3 +198,46 @@ def execution_identity_from_task(
         default_preferred_agent=default_preferred_agent,
         explicit_exec_mode=explicit,
     )
+
+
+def resolve_delivery_task_org_identity(
+    task: Any | None,
+    *,
+    payload: Mapping[str, Any] | None = None,
+    active_org_id: Any = "",
+    default_org_id: Any = "",
+) -> tuple[str, str]:
+    """Validate the org identity of a delivery self-evolution task.
+
+    Returns ``(organization_id, error)`` with at most one non-empty. Prefers
+    ``Task.org_id``, then task metadata org fields; conflicting sources are
+    rejected. Checkpoint-payload org fields are a last-resort legacy fallback
+    and never override task/metadata identity. The active configuration org
+    is only consulted for a confirmed corporate task; custom-org deliveries
+    without a durable org id fail closed.
+    """
+    metadata = task_metadata(task)
+    candidates: list[str] = []
+    for value in (
+        getattr(task, "org_id", None),
+        metadata.get("org_id"),
+        metadata.get("organization_id"),
+    ):
+        normalized = normalize_org_id(value)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    if len(candidates) > 1:
+        return "", "the delivery task org identity conflicts across task and metadata sources"
+    task_org_id = candidates[0] if candidates else ""
+    if task_org_id:
+        return task_org_id, ""
+    payload_org_id = normalize_org_id(
+        (payload or {}).get("org_id")
+        or (payload or {}).get("organization_id")
+    )
+    if payload_org_id:
+        return payload_org_id, ""
+    identity = execution_identity_from_task(task)
+    if identity.is_company:
+        return normalize_org_id(active_org_id) or normalize_org_id(default_org_id), ""
+    return "", "the custom-organization delivery task has no durable org identity"

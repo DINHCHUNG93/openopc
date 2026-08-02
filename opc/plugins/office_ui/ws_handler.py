@@ -7854,6 +7854,16 @@ class WSHandler:
                         parent_task = await run_engine.store.get_task(parent_task_id)
                     except Exception:
                         logger.opt(exception=True).debug("failed to load parent task for delivery feedback reply")
+                if parent_task is None:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": pid,
+                            "task_id": parent_task_id,
+                            "reason": "delivery_feedback_requires_durable_parent_task",
+                        },
+                    )
                 session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
                 session_company_profile = self._normalize_session_company_profile(self._company_profile)
                 session_org_id = ""

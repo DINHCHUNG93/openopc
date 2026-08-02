@@ -22,7 +22,11 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
-from opc.core.config import DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS, DEFAULT_ORGANIZATION_ID
+from opc.core.config import (
+    DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS,
+    DEFAULT_ORGANIZATION_ID,
+    validate_organization_id,
+)
 from opc.core.models import (
     AdaptiveRoleProfile,
     AdaptiveSignalSpec,
@@ -1326,6 +1330,26 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             or "corporate"
         ).strip() or "corporate"
         org_config = getattr(self.org_engine.config, "org", None)
+        selected_org_id = ""
+        if profile == "custom":
+            try:
+                selected_org_id = validate_organization_id(getattr(decision, "org_id", None))
+            except ValueError:
+                selected_org_id = ""
+            if not selected_org_id:
+                # A custom-organization run must carry a durable org_id on the
+                # decision.  Never derive it from the process-wide active
+                # config; fail closed before any work items are created.
+                from opc.plugins.office_ui.services.models import ServiceError
+                raise ServiceError(
+                    "org_id_required",
+                    "org_id_required",
+                    {
+                        "company_profile": profile,
+                        "reason": "custom_company_run_requires_durable_org_id",
+                    },
+                )
+            decision.org_id = selected_org_id
         metadata: dict[str, Any] = {
             "source": "work_item_runtime",
             "execution_mode": "company_mode",
@@ -1333,7 +1357,11 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             "runtime_model": "multi_team_org",
             "work_item_driven": True,
             "company_profile": profile,
-            "organization_id": str(getattr(org_config, "organization_id", "") or "").strip(),
+            "organization_id": (
+                selected_org_id
+                if profile == "custom"
+                else str(getattr(org_config, "organization_id", "") or "").strip()
+            ),
             "organization_name": str(getattr(org_config, "organization_name", "") or "").strip(),
             "organization_config_file": str(getattr(org_config, "organization_config_file", "") or "").strip(),
             "original_request": original_message,
@@ -1341,7 +1369,7 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             "domains": list(getattr(decision, "domains", []) or []),
             "preferred_agent": getattr(decision, "preferred_agent", None),
             "requested_sub_tasks": list(getattr(decision, "sub_tasks", []) or []),
-            "org_id": getattr(decision, "org_id", None),
+            "org_id": selected_org_id if profile == "custom" else getattr(decision, "org_id", None),
         }
         return CompanyRuntimeSpec(
             profile=profile,

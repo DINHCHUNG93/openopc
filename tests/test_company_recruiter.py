@@ -2072,6 +2072,7 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             decision = RouterDecision(
                 mode=ExecutionMode.COMPANY_MODE,
                 company_profile="custom",
+                org_id="test-org",
                 domains=[],
             )
             runtime_spec = engine.company_runtime_spec_builder.build_spec(
@@ -2140,6 +2141,7 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             decision = RouterDecision(
                 mode=ExecutionMode.COMPANY_MODE,
                 company_profile="custom",
+                org_id="test-org",
                 domains=[],
             )
             runtime_spec = engine.company_runtime_spec_builder.build_spec(
@@ -2199,6 +2201,7 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             decision = RouterDecision(
                 mode=ExecutionMode.COMPANY_MODE,
                 company_profile="custom",
+                org_id="test-org",
                 domains=[],
             )
             runtime_spec = engine.company_runtime_spec_builder.build_spec(
@@ -2312,6 +2315,7 @@ class CompanyRecruiterFlowTests(unittest.IsolatedAsyncioTestCase):
             decision = RouterDecision(
                 mode=ExecutionMode.COMPANY_MODE,
                 company_profile="custom",
+                org_id="test-org",
                 domains=[],
             )
             runtime_spec = engine.company_runtime_spec_builder.build_spec(
