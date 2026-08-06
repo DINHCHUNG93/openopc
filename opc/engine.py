@@ -37,6 +37,7 @@ from opc.core.config import (
     company_org_path,
     get_opc_home,
     get_project_workplace,
+    validate_organization_id,
 )
 from opc.core.events import EventBus
 from opc.core.models import (
@@ -3564,6 +3565,39 @@ class OPCEngine:
         return bool(dict(getattr(task, "metadata", {}) or {}).get("shared_role_session", False))
 
     @staticmethod
+    def _normalize_durable_org_id(value: Any) -> str:
+        try:
+            return validate_organization_id(value)
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _runtime_org_id_for_identity(
+        decision: RouterDecision | None,
+        metadata: dict[str, Any] | None,
+        org_config: Any | None,
+    ) -> str | None:
+        """Return the durable custom-org ID for a company runtime task."""
+        task_metadata = dict(metadata or {})
+        profile = str(
+            getattr(decision, "company_profile", "")
+            or task_metadata.get("company_profile", "")
+            or getattr(org_config, "company_profile", "")
+            or ""
+        ).strip().lower()
+        if profile != "custom":
+            return None
+        for candidate in (
+            getattr(decision, "org_id", None),
+            task_metadata.get("org_id"),
+            task_metadata.get("organization_id"),
+        ):
+            normalized = str(candidate or "").strip()
+            if normalized:
+                return normalized
+        return None
+
+    @staticmethod
     def _shared_company_role_session_id(
         parent_session_id: str,
         role_id: str,
@@ -3601,6 +3635,17 @@ class OPCEngine:
         root_session: bool = False,
     ) -> Task:
         assert self.store and self.memory
+        runtime_company_profile = str(
+            getattr(decision, "company_profile", "")
+            or (work_item.metadata or {}).get("company_profile", "")
+            or getattr(getattr(self.config, "org", None), "company_profile", "")
+            or ""
+        ).strip().lower()
+        runtime_org_id = self._runtime_org_id_for_identity(
+            decision,
+            getattr(work_item, "metadata", None),
+            getattr(getattr(self, "config", None), "org", None),
+        )
         role_id = str(work_item.role_id or "").strip()
         seat_id = str((work_item.metadata or {}).get("seat_id", "") or "").strip()
         team_id = str((work_item.metadata or {}).get("team_id", "") or work_item.cell_id or "").strip()
@@ -3653,6 +3698,42 @@ class OPCEngine:
             set_linked_work_item_id(existing, work_item.work_item_id)
             existing.session_id = session_id
             existing.metadata = dict(existing.metadata or {})
+            if runtime_company_profile == "custom":
+                persisted_org_id = self._normalize_durable_org_id(getattr(existing, "org_id", None))
+                incoming_org_id = self._normalize_durable_org_id(runtime_org_id)
+                if persisted_org_id and incoming_org_id and persisted_org_id != incoming_org_id:
+                    from opc.plugins.office_ui.services.models import ServiceError
+                    raise ServiceError(
+                        "org_id_conflict",
+                        "org_id_conflict",
+                        {
+                            "project_id": self.project_id or "default",
+                            "task_id": str(getattr(work_item, "work_item_id", "") or ""),
+                            "persisted_org_id": persisted_org_id,
+                            "incoming_org_id": incoming_org_id,
+                            "reason": "custom_company_run_org_id_conflict",
+                        },
+                    )
+                resolved_org_id = persisted_org_id or incoming_org_id
+                if not resolved_org_id:
+                    from opc.plugins.office_ui.services.models import ServiceError
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": self.project_id or "default",
+                            "task_id": str(getattr(work_item, "work_item_id", "") or ""),
+                            "reason": "custom_company_run_requires_durable_org_id",
+                        },
+                    )
+                runtime_org_id = resolved_org_id
+                existing.org_id = resolved_org_id
+                existing.metadata["org_id"] = resolved_org_id
+                existing.metadata["organization_id"] = resolved_org_id
+            elif runtime_org_id:
+                existing.org_id = runtime_org_id
+                existing.metadata["org_id"] = runtime_org_id
+                existing.metadata["organization_id"] = runtime_org_id
             existing.metadata["shared_role_session"] = True
             existing.metadata["shared_role_id"] = role_id
             existing.metadata["company_runtime_root_session_id"] = parent_session_id
@@ -3694,6 +3775,17 @@ class OPCEngine:
             )
             await self.store.save_task(existing)
             return existing
+        if runtime_company_profile == "custom" and not runtime_org_id:
+            from opc.plugins.office_ui.services.models import ServiceError
+            raise ServiceError(
+                "org_id_required",
+                "org_id_required",
+                {
+                    "project_id": self.project_id or "default",
+                    "task_id": str(getattr(work_item, "work_item_id", "") or ""),
+                    "reason": "custom_company_run_requires_durable_org_id",
+                },
+            )
         employee_assignment = dict(topology_seat.get("employee_assignment", {}) or {})
         if not employee_assignment and self.org_engine and role_id:
             preferred_employee_id = str(topology_seat.get("employee_id", "") or "").strip() or None
@@ -3744,6 +3836,18 @@ class OPCEngine:
         owner_execution_copy = build_work_item_owner_execution_copy(work_item)
         owner_execution_copy.setdefault("delegation_role_session_id", role_session_id)
         owner_execution_copy["work_kind"] = work_item_turn_type
+        runtime_identity_metadata = (
+            {
+                "org_id": runtime_org_id or "",
+                "organization_id": runtime_org_id or "",
+            }
+            if runtime_company_profile == "custom"
+            else {
+                "organization_id": str(
+                    getattr(getattr(self.config, "org", None), "organization_id", "") or ""
+                ).strip(),
+            }
+        )
         task = Task(
             title=str(work_item.title or work_item_projection_ref or "Runtime Work Item").strip(),
             description=(
@@ -3757,6 +3861,7 @@ class OPCEngine:
             session_id=session_id,
             parent_session_id=parent_session_id,
             assigned_external_agent=assigned_external_agent,
+            org_id=runtime_org_id,
             metadata=mark_work_item_projection(mark_work_item_runtime({
                 "mode": "company",
                 "execution_mode": decision.mode.value,
@@ -3765,7 +3870,6 @@ class OPCEngine:
                 "original_message": original_message,
                 "router_preferred_agent": decision.preferred_agent,
                 "company_profile": decision.company_profile or getattr(self.config.org, "company_profile", "corporate"),
-                "organization_id": getattr(self.config.org, "organization_id", ""),
                 "organization_name": getattr(self.config.org, "organization_name", ""),
                 "organization_config_file": getattr(self.config.org, "organization_config_file", ""),
                 "delegation_playbook": dict(delegation_playbook),
@@ -3780,6 +3884,7 @@ class OPCEngine:
                 ),
                 "runtime_topology": copy.deepcopy(runtime_topology),
                 **owner_execution_copy,
+                **runtime_identity_metadata,
                 "work_item_projection_ref": work_item_projection_ref,
                 "seat_manager_role_id": str(topology_seat.get("manager_role_id", "") or "").strip(),
                 "manager_role_id": str(topology_seat.get("manager_role_id", "") or "").strip(),
@@ -12649,7 +12754,12 @@ class OPCEngine:
             seen_employee_ids.add(employee_id)
             history = ""
             if self.memory:
-                organization_id = str(getattr(getattr(self.config, "org", None), "organization_id", "") or "").strip()
+                organization_id = str(
+                    getattr(delivery_task, "org_id", "")
+                    or (delivery_task.metadata or {}).get("org_id")
+                    or (delivery_task.metadata or {}).get("organization_id")
+                    or ""
+                ).strip()
                 history = self.memory.employee_evolution.build_employee_delta_context(
                     employee_id,
                     project_id=task.project_id,
@@ -13191,13 +13301,19 @@ class OPCEngine:
             await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
             return "Could not run self-evolution because the runtime task set could not be restored."
 
+        from opc.plugins.office_ui.execution_identity import resolve_delivery_task_org_identity
+
+        organization_id, identity_error = resolve_delivery_task_org_identity(
+            waiting_task,
+            payload=payload,
+            active_org_id=getattr(getattr(self.config, "org", None), "organization_id", ""),
+            default_org_id=DEFAULT_ORGANIZATION_ID,
+        )
+        if identity_error:
+            await self._mark_company_runtime_checkpoint_status(checkpoint, status="invalid")
+            return f"Could not run self-evolution because {identity_error}."
+
         plan = deserialize_company_work_item_runtime_plan(payload.get("company_work_item_plan") or payload.get("plan", {}))
-        organization_id = str(
-            getattr(waiting_task, "org_id", "")
-            or payload.get("organization_id")
-            or getattr(getattr(self.config, "org", None), "organization_id", "")
-            or DEFAULT_ORGANIZATION_ID
-        ).strip() or DEFAULT_ORGANIZATION_ID
         root_role_id = str(
             getattr(plan, "final_decider_role_id", "")
             or plan.metadata.get("final_decider_role_id", "")

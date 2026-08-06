@@ -4967,6 +4967,50 @@ class WSHandler:
     def _resolve_task_org_id(self, task: Any | None) -> str:
         return self._ensure_office_services().session.resolve_task_org_id(task)
 
+    async def _resolve_session_runtime_config_task(
+        self,
+        task_id: str,
+        task: Any | None,
+        *,
+        engine: Any,
+    ) -> Any | None:
+        """Resolve company-session config from the durable runtime identity."""
+        if task is None:
+            return None
+        exec_mode, _ = self._resolve_task_session_config(task)
+        runtime_bound = is_company_runtime_task(task)
+        if not runtime_bound and not self._is_company_session_exec_mode(exec_mode):
+            return task
+        try:
+            target = await self._resolve_company_runtime_target(task_id, engine=engine)
+        except ServiceError:
+            if runtime_bound:
+                raise
+            logger.opt(exception=True).debug(
+                "failed to resolve durable session config task"
+            )
+            return task
+        except Exception as exc:
+            if runtime_bound:
+                raise ServiceError(
+                    "company_runtime_identity_mismatch",
+                    "Company runtime identity could not be resolved",
+                    {"task_id": str(task_id or "").strip()},
+                ) from exc
+            logger.opt(exception=True).debug(
+                "failed to resolve durable session config task"
+            )
+            return task
+        if target is not None:
+            return target.get("config_task") or task
+        if runtime_bound:
+            raise ServiceError(
+                "company_runtime_identity_mismatch",
+                "Company runtime identity could not be resolved",
+                {"task_id": str(task_id or "").strip()},
+            )
+        return task
+
     @staticmethod
     def _is_company_session_exec_mode(exec_mode: Any) -> bool:
         return str(exec_mode or "").strip().lower() in {"company", "org", "custom"}
@@ -5037,14 +5081,24 @@ class WSHandler:
         # Look up session_id from task
         session_id: str | None = None
         task = None
+        config_task = None
         preferred_agent = self._task_preferred_agent
         session_org_id = self._normalize_session_org_id(org_id)
         if task_id and getattr(engine, "store", None):
             task = await engine.store.get_task(task_id)
             if task:
                 session_id = task.session_id
-                identity = self._resolve_task_identity(
+
+        company_runtime_target: dict[str, Any] | None = None
+        try:
+            if task is not None:
+                config_task = await self._resolve_session_runtime_config_task(
+                    task_id,
                     task,
+                    engine=engine,
+                )
+                identity = self._resolve_task_identity(
+                    config_task,
                     default_exec_mode=mode,
                     default_company_profile=profile,
                     default_preferred_agent=preferred_agent,
@@ -5054,9 +5108,12 @@ class WSHandler:
                 profile = identity.company_profile
                 session_org_id = identity.org_id
                 preferred_agent = identity.preferred_agent
-
-        company_runtime_target: dict[str, Any] | None = None
-        try:
+                if identity.is_custom_org and not identity.org_id:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {"project_id": pid, "task_id": task_id},
+                    )
             content = f"{title}\n{description}".strip()
             engine_mode, company_profile = self._resolve_engine_mode(mode, profile)
             engine_preferred_agent = preferred_agent if engine_mode == "project" else None
@@ -7797,6 +7854,16 @@ class WSHandler:
                         parent_task = await run_engine.store.get_task(parent_task_id)
                     except Exception:
                         logger.opt(exception=True).debug("failed to load parent task for delivery feedback reply")
+                if parent_task is None:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": pid,
+                            "task_id": parent_task_id,
+                            "reason": "delivery_feedback_requires_durable_parent_task",
+                        },
+                    )
                 session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
                 session_company_profile = self._normalize_session_company_profile(self._company_profile)
                 session_org_id = ""
@@ -8102,17 +8169,6 @@ class WSHandler:
         pid = self._normalize_project_id(run_project_id or getattr(run_engine, "project_id", None))
         async with lock:
             try:
-                try:
-                    await self._set_company_runtime_control(
-                        target,
-                        state="resuming",
-                        checkpoint_id=str(
-                            getattr(checkpoint, "checkpoint_id", "") or ""
-                        ).strip(),
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("failed to broadcast company suspend reply routing state")
-
                 config_task = target.get("config_task")
                 session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
                 session_company_profile = self._normalize_session_company_profile(self._company_profile)
@@ -8124,6 +8180,27 @@ class WSHandler:
                     session_exec_mode,
                     session_company_profile,
                 )
+                if engine_mode == "org" and not session_org_id:
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {
+                            "project_id": pid,
+                            "task_id": str(target.get("config_source_task_id", "") or "").strip(),
+                        },
+                    )
+
+                try:
+                    await self._set_company_runtime_control(
+                        target,
+                        state="resuming",
+                        checkpoint_id=str(
+                            getattr(checkpoint, "checkpoint_id", "") or ""
+                        ).strip(),
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug("failed to broadcast company suspend reply routing state")
+
                 engine_message_metadata = dict(message_metadata or {})
                 engine_message_metadata.update({
                     "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or ""),
@@ -8590,12 +8667,36 @@ class WSHandler:
                 item
                 for item in pending or []
                 if str(getattr(item, "checkpoint_id", "") or "").strip() == checkpoint_id
-                and str(getattr(item, "checkpoint_type", "") or "").strip()
-                in self._LOCK_FREE_CHECKPOINT_ANSWER_TYPES
+                and str(getattr(item, "checkpoint_type", "") or "").strip() == checkpoint_type
             ),
             None,
         )
         if checkpoint is None:
+            return False
+        checkpoint_payload = dict(getattr(checkpoint, "payload", {}) or {})
+        checkpoint_task_id = str(
+            getattr(checkpoint, "task_id", "")
+            or checkpoint_payload.get("waiting_task_id")
+            or checkpoint_payload.get("task_id")
+            or ""
+        ).strip()
+        checkpoint_session_id = str(
+            getattr(checkpoint, "session_id", "")
+            or checkpoint_payload.get("session_id")
+            or ""
+        ).strip()
+        payload_task_ids = {
+            str(item).strip()
+            for item in list(checkpoint_payload.get("task_ids", []) or [])
+            if str(item).strip()
+        }
+        if (
+            not checkpoint_task_id
+            or checkpoint_task_id != str(task_id or "").strip()
+            or not checkpoint_session_id
+            or checkpoint_session_id != str(session_id or "").strip()
+            or (payload_task_ids and str(task_id or "").strip() not in payload_task_ids)
+        ):
             return False
         logger.info(
             f"Lock-free checkpoint answer: task lock for {task_id} is held by a "
@@ -8694,14 +8795,32 @@ class WSHandler:
         session_preferred_agent = self._task_preferred_agent
         session_org_id = ""
         task = None
+        config_task = None
         store = engine.store
         if self._store_is_ready(store):
             from opc.core.models import TaskStatus
             task = await store.get_task(task_id)
             if task:
-                session_exec_mode, session_company_profile = self._resolve_task_session_config(task)
-                session_org_id = self._resolve_task_org_id(task)
-                session_preferred_agent = self._resolve_task_preferred_agent(task)
+                config_task = await self._resolve_session_runtime_config_task(
+                    task_id,
+                    task,
+                    engine=engine,
+                )
+                session_exec_mode, session_company_profile = self._resolve_task_session_config(
+                    config_task
+                )
+                session_org_id = self._resolve_task_org_id(config_task)
+                session_preferred_agent = self._resolve_task_preferred_agent(config_task)
+                if (
+                    session_exec_mode in {"org", "custom"}
+                    and not session_org_id
+                    and is_company_runtime_task(task)
+                ):
+                    raise ServiceError(
+                        "org_id_required",
+                        "org_id_required",
+                        {"project_id": pid, "task_id": task_id},
+                    )
 
         if await self._try_lock_free_parked_checkpoint_answer(
             task_id=task_id,
@@ -8729,9 +8848,26 @@ class WSHandler:
                 from opc.core.models import TaskStatus
                 task = await store.get_task(task_id)
                 if task:
-                    session_exec_mode, session_company_profile = self._resolve_task_session_config(task)
-                    session_org_id = self._resolve_task_org_id(task)
-                    session_preferred_agent = self._resolve_task_preferred_agent(task)
+                    config_task = await self._resolve_session_runtime_config_task(
+                        task_id,
+                        task,
+                        engine=engine,
+                    )
+                    session_exec_mode, session_company_profile = self._resolve_task_session_config(
+                        config_task
+                    )
+                    session_org_id = self._resolve_task_org_id(config_task)
+                    session_preferred_agent = self._resolve_task_preferred_agent(config_task)
+                    if (
+                        session_exec_mode in {"org", "custom"}
+                        and not session_org_id
+                        and is_company_runtime_task(task)
+                    ):
+                        raise ServiceError(
+                            "org_id_required",
+                            "org_id_required",
+                            {"project_id": pid, "task_id": task_id},
+                        )
                     if task.status == TaskStatus.DONE and self._is_company_session_exec_mode(session_exec_mode):
                         task.status = TaskStatus.IDLE
                         task.metadata = dict(getattr(task, "metadata", {}) or {})
@@ -8757,12 +8893,17 @@ class WSHandler:
                 except Exception:
                     logger.opt(exception=True).debug("failed to mark company session runtime running")
             try:
-                engine_mode, company_profile = self._resolve_engine_mode(
-                    session_exec_mode,
-                    session_company_profile,
+                config_task_id = str(getattr(config_task, "id", "") or "").strip()
+                selected_task_id = str(getattr(task, "id", "") or "").strip()
+                should_persist_selected_config = bool(
+                    task is not None
+                    and (
+                        not config_task_id
+                        or config_task_id == selected_task_id
+                        or (session_exec_mode == "org" and not session_org_id)
+                    )
                 )
-                engine_preferred_agent = session_preferred_agent if session_exec_mode == "task" else None
-                if task is not None:
+                if should_persist_selected_config:
                     await self._persist_session_config(
                         task,
                         exec_mode=session_exec_mode,
@@ -8771,6 +8912,22 @@ class WSHandler:
                         org_id=session_org_id,
                         engine=engine,
                     )
+                    persisted_identity = self._resolve_task_identity(
+                        task,
+                        default_exec_mode=session_exec_mode,
+                        default_company_profile=session_company_profile,
+                        default_preferred_agent=session_preferred_agent,
+                        default_org_id=session_org_id,
+                    )
+                    session_exec_mode = persisted_identity.exec_mode
+                    session_company_profile = persisted_identity.company_profile
+                    session_preferred_agent = persisted_identity.preferred_agent
+                    session_org_id = persisted_identity.org_id
+                engine_mode, company_profile = self._resolve_engine_mode(
+                    session_exec_mode,
+                    session_company_profile,
+                )
+                engine_preferred_agent = session_preferred_agent if session_exec_mode == "task" else None
                 engine_message_metadata = dict(message_metadata or {})
                 engine_message_metadata.update(_ui_message_identity_metadata(
                     message_id=user_message_id,

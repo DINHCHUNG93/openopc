@@ -22,7 +22,11 @@ from opc.core.active_task_runs import (
     ActiveTaskRunAdmissionClosed,
     ActiveTaskRunRegistry,
 )
-from opc.core.config import DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS, DEFAULT_ORGANIZATION_ID
+from opc.core.config import (
+    DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS,
+    DEFAULT_ORGANIZATION_ID,
+    validate_organization_id,
+)
 from opc.core.models import (
     AdaptiveRoleProfile,
     AdaptiveSignalSpec,
@@ -1326,6 +1330,26 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             or "corporate"
         ).strip() or "corporate"
         org_config = getattr(self.org_engine.config, "org", None)
+        selected_org_id = ""
+        if profile == "custom":
+            try:
+                selected_org_id = validate_organization_id(getattr(decision, "org_id", None))
+            except ValueError:
+                selected_org_id = ""
+            if not selected_org_id:
+                # A custom-organization run must carry a durable org_id on the
+                # decision.  Never derive it from the process-wide active
+                # config; fail closed before any work items are created.
+                from opc.plugins.office_ui.services.models import ServiceError
+                raise ServiceError(
+                    "org_id_required",
+                    "org_id_required",
+                    {
+                        "company_profile": profile,
+                        "reason": "custom_company_run_requires_durable_org_id",
+                    },
+                )
+            decision.org_id = selected_org_id
         metadata: dict[str, Any] = {
             "source": "work_item_runtime",
             "execution_mode": "company_mode",
@@ -1333,7 +1357,11 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             "runtime_model": "multi_team_org",
             "work_item_driven": True,
             "company_profile": profile,
-            "organization_id": str(getattr(org_config, "organization_id", "") or "").strip(),
+            "organization_id": (
+                selected_org_id
+                if profile == "custom"
+                else str(getattr(org_config, "organization_id", "") or "").strip()
+            ),
             "organization_name": str(getattr(org_config, "organization_name", "") or "").strip(),
             "organization_config_file": str(getattr(org_config, "organization_config_file", "") or "").strip(),
             "original_request": original_message,
@@ -1341,7 +1369,7 @@ class CompanyRuntimeSpecBuilder(CompanyRuntimeWorkItemHelper):
             "domains": list(getattr(decision, "domains", []) or []),
             "preferred_agent": getattr(decision, "preferred_agent", None),
             "requested_sub_tasks": list(getattr(decision, "sub_tasks", []) or []),
-            "org_id": getattr(decision, "org_id", None),
+            "org_id": selected_org_id if profile == "custom" else getattr(decision, "org_id", None),
         }
         return CompanyRuntimeSpec(
             profile=profile,
@@ -4247,7 +4275,21 @@ class CompanyWorkItemExecutor:
         existing_task_ids = {str(task.id or "").strip() for task in existing_tasks if str(task.id or "").strip()}
         existing_work_item_ids = set(task_by_linked_work_item_id(existing_tasks))
         root_task = sorted(existing_tasks, key=lambda item: (item.created_at, item.id))[0]
-        runtime_topology = dict((root_task.metadata or {}).get("runtime_topology", {}) or {})
+        root_metadata = dict(root_task.metadata or {})
+        custom_runtime = str(root_metadata.get("company_profile", "") or "").strip().lower() == "custom"
+        runtime_org_id = str(
+            getattr(root_task, "org_id", "")
+            or root_metadata.get("org_id")
+            or root_metadata.get("organization_id")
+            or ""
+        ).strip() or None
+        if not custom_runtime:
+            runtime_org_id = None
+        if runtime_org_id:
+            for existing_task in existing_tasks:
+                if self._sync_runtime_org_identity(existing_task, runtime_org_id):
+                    await self.store.save_task(existing_task)
+        runtime_topology = dict(root_metadata.get("runtime_topology", {}) or {})
         root_parent_session_id = str(
             root_task.parent_session_id
             or root_task.session_id
@@ -4283,6 +4325,8 @@ class CompanyWorkItemExecutor:
                 persisted = await get_runtime_task(work_item_id)
             if persisted is not None:
                 set_linked_work_item_id(persisted, work_item_id)
+                if self._sync_runtime_org_identity(persisted, runtime_org_id):
+                    await self.store.save_task(persisted)
                 self._raise_for_runtime_projection_issues(persisted, work_item, work_item_by_id)
                 if persisted.id not in existing_task_ids:
                     existing_tasks.append(persisted)
@@ -4413,6 +4457,9 @@ class CompanyWorkItemExecutor:
             task_metadata.update(copy_work_item_execution_metadata(work_item))
             task_metadata.update(owner_execution_copy)
             task_metadata[WORK_ITEM_TURN_TYPE_KEY] = turn_type
+            if custom_runtime:
+                task_metadata["org_id"] = runtime_org_id or ""
+                task_metadata["organization_id"] = runtime_org_id or ""
             temp_task = Task(
                 id=str(uuid.uuid4()),
                 title=str(getattr(work_item, "title", "") or projection_id or "Runtime Work Item").strip(),
@@ -4423,6 +4470,7 @@ class CompanyWorkItemExecutor:
                 session_id=session_id,
                 parent_session_id=root_parent_session_id,
                 assigned_external_agent=assigned_external_agent,
+                org_id=runtime_org_id,
                 metadata=task_metadata,
             )
             dependency_projection_ids: list[str] = []
@@ -4454,6 +4502,7 @@ class CompanyWorkItemExecutor:
                 parent_session_id=temp_task.parent_session_id,
                 assigned_external_agent=temp_task.assigned_external_agent,
                 dependencies=dependency_projection_ids,
+                org_id=runtime_org_id,
                 metadata=task_metadata,
             )
             set_linked_work_item_id(task, work_item_id)
@@ -4471,6 +4520,8 @@ class CompanyWorkItemExecutor:
                             "failed to link new runtime Task "
                             f"{task.id} for WorkItem {work_item_id}"
                         )
+            if self._sync_runtime_org_identity(task, runtime_org_id):
+                await self.store.save_task(task)
             set_linked_work_item_id(task, work_item_id)
             self._raise_for_runtime_projection_issues(task, work_item, work_item_by_id)
             if self.memory is not None and task.session_id:
@@ -4509,6 +4560,23 @@ class CompanyWorkItemExecutor:
                 await self._record_handoffs(task, task_by_projection_id)
                 await self.save_task(task)
         return existing_tasks
+
+    @staticmethod
+    def _sync_runtime_org_identity(task: Task, org_id: str | None) -> bool:
+        normalized_org_id = str(org_id or "").strip()
+        if not normalized_org_id:
+            return False
+        metadata = dict(task.metadata or {})
+        changed = str(getattr(task, "org_id", "") or "").strip() != normalized_org_id
+        changed = changed or metadata.get("org_id") != normalized_org_id
+        changed = changed or metadata.get("organization_id") != normalized_org_id
+        if not changed:
+            return False
+        task.org_id = normalized_org_id
+        metadata["org_id"] = normalized_org_id
+        metadata["organization_id"] = normalized_org_id
+        task.metadata = metadata
+        return True
 
     @staticmethod
     def _runtime_work_kind_to_work_item_turn_type(work_kind: str) -> str:
