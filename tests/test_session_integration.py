@@ -2061,16 +2061,28 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             return_value="wrong-active-org"
         )
 
-        with self.assertRaises(ServiceError) as context:
-            await self.handler._process_session_message(
-                self.task_id,
-                "approve",
-                session_id=self.session_id,
-            )
+        # Fail closed without raising: this coroutine usually runs as a
+        # fire-and-forget background task where an escaping ServiceError is
+        # only logged and the user's message silently vanishes. The rejection
+        # must instead surface as a visible chat error.
+        await self.handler._process_session_message(
+            self.task_id,
+            "approve",
+            session_id=self.session_id,
+        )
 
         self.engine.process_message.assert_not_called()
         self.handler.services_context.get_active_saved_org_name.assert_not_awaited()
-        self.assertEqual(context.exception.code, "company_runtime_identity_mismatch")
+        errors = [
+            msg["payload"].get("content", "")
+            for msg in self.broadcasts
+            if msg.get("type") == "session_message"
+            and str(msg.get("payload", {}).get("sender", "")) == "system"
+        ]
+        self.assertTrue(
+            any("Company runtime identity could not be resolved" in text for text in errors),
+            errors,
+        )
 
     async def test_process_session_message_rejects_runtime_org_without_durable_org_id(self) -> None:
         runtime_session_id = "runtime-org-missing-id-session"
@@ -2104,16 +2116,27 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             return_value="wrong-active-org"
         )
 
-        with self.assertRaises(ServiceError) as context:
-            await self.handler._process_session_message(
-                role_task.id,
-                "approve",
-                session_id=role_task.session_id,
-            )
+        # Same fail-closed-without-raising contract as the identity-mismatch
+        # case above: reject visibly instead of raising out of a background
+        # task.
+        await self.handler._process_session_message(
+            role_task.id,
+            "approve",
+            session_id=role_task.session_id,
+        )
 
         self.engine.process_message.assert_not_called()
         self.handler.services_context.get_active_saved_org_name.assert_not_awaited()
-        self.assertEqual(context.exception.code, "org_id_required")
+        errors = [
+            msg["payload"].get("content", "")
+            for msg in self.broadcasts
+            if msg.get("type") == "session_message"
+            and str(msg.get("payload", {}).get("sender", "")) == "system"
+        ]
+        self.assertTrue(
+            any("org_id_required" in text for text in errors),
+            errors,
+        )
 
     async def test_lock_free_process_session_message_uses_durable_org_for_role_task(self) -> None:
         runtime_session_id = "runtime-org-lock-free-session"

@@ -263,6 +263,104 @@ class LockFreeCheckpointAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(handled)
         self.assertEqual(engine.calls, [])
 
+    async def test_anchor_channel_answer_for_role_task_gate_is_handled(self) -> None:
+        # Project-0012 production shape: a company gate checkpoint is raised
+        # by a role work-item task, but the card is answered from the run's
+        # anchor chat channel. The anchor task id only appears in
+        # payload["task_ids"]; exact task/session equality would reject it
+        # and re-open the late-approval lock wedge.
+        checkpoint = SimpleNamespace(
+            checkpoint_id="ckpt-park",
+            checkpoint_type="company_work_item_gate",
+            status="pending",
+            task_id="role-task",
+            session_id="role-session",
+            payload={
+                "waiting_task_id": "role-task",
+                "session_id": "role-session",
+                "task_ids": ["role-task", "chat-task"],
+            },
+        )
+        engine = _EngineStub(_StoreStub([checkpoint]))
+        handler = _make_handler(engine)
+        holder = await self._hold_lock(handler, "chat-task")
+        try:
+            handled = await handler._try_lock_free_parked_checkpoint_answer(
+                engine=engine,
+                **_answer_kwargs(
+                    message_metadata={
+                        "response_to_checkpoint_id": "ckpt-park",
+                        "response_to_checkpoint_type": "company_work_item_gate",
+                    },
+                ),
+            )
+            self.assertTrue(handled)
+            self.assertEqual(len(engine.calls), 1)
+        finally:
+            holder.release_event.set()  # type: ignore[attr-defined]
+            await holder
+
+    async def test_legacy_checkpoint_without_linkage_is_still_handled(self) -> None:
+        # Checkpoints persisted before ownership fields existed carry no
+        # task/session linkage at all. They must keep the pre-scoping
+        # behavior (deliver by explicit checkpoint id) instead of silently
+        # falling back to the wedged serialized path.
+        checkpoint = SimpleNamespace(
+            checkpoint_id="ckpt-park",
+            checkpoint_type="task_user_input",
+            status="pending",
+            payload={},
+        )
+        engine = _EngineStub(_StoreStub([checkpoint]))
+        handler = _make_handler(engine)
+        holder = await self._hold_lock(handler, "chat-task")
+        try:
+            handled = await handler._try_lock_free_parked_checkpoint_answer(
+                engine=engine, **_answer_kwargs()
+            )
+            self.assertTrue(handled)
+            self.assertEqual(len(engine.calls), 1)
+        finally:
+            holder.release_event.set()  # type: ignore[attr-defined]
+            await holder
+
+
+class SessionIdentityErrorSurfacingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identity_service_error_surfaces_in_chat_instead_of_raising(self) -> None:
+        # _process_session_message mostly runs as a fire-and-forget background
+        # task; a ServiceError escaping it is only logged and the user's
+        # message silently vanishes. The pre-lock identity resolution must
+        # surface the failure as a visible chat error and stop.
+        from opc.plugins.office_ui.services.models import ServiceError
+
+        class _Store:
+            async def get_task(self, task_id: str) -> Any:
+                return SimpleNamespace(id=task_id, session_id="sess-1", metadata={})
+
+        engine = _EngineStub(_Store())
+        handler = _make_handler(engine)
+        handler.engine = engine
+        handler._session_to_task = {}
+        handler._exec_mode = "company"
+        handler._company_profile = "corporate"
+        handler._task_preferred_agent = "native"
+
+        async def _raise_identity_error(*args: Any, **kwargs: Any) -> Any:
+            raise ServiceError(
+                "company_runtime_identity_mismatch",
+                "Company runtime identity could not be resolved",
+                {"task_id": "chat-task"},
+            )
+
+        handler._resolve_session_runtime_config_task = _raise_identity_error
+
+        await handler._process_session_message("chat-task", "please continue")
+
+        self.assertEqual(engine.calls, [])
+        errors = [m for m in handler.chat_store.inserted if m.get("sender") == "system"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Company runtime identity could not be resolved", errors[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

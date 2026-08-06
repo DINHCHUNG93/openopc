@@ -8673,29 +8673,35 @@ class WSHandler:
         )
         if checkpoint is None:
             return False
+        # Ownership scoping must accept every channel the card legitimately
+        # reaches, not just the task that raised the checkpoint: company gate
+        # cards raised by role work items are answered from the run's anchor
+        # chat, whose task id only appears in payload["task_ids"] (the same
+        # linkage set _find_parked_checkpoint_for_deferred_resume uses). An
+        # exact task/session equality check would silently disable this fast
+        # path for those answers and re-open the late-approval lock wedge.
         checkpoint_payload = dict(getattr(checkpoint, "payload", {}) or {})
-        checkpoint_task_id = str(
-            getattr(checkpoint, "task_id", "")
-            or checkpoint_payload.get("waiting_task_id")
-            or checkpoint_payload.get("task_id")
-            or ""
-        ).strip()
-        checkpoint_session_id = str(
-            getattr(checkpoint, "session_id", "")
-            or checkpoint_payload.get("session_id")
-            or ""
-        ).strip()
-        payload_task_ids = {
-            str(item).strip()
-            for item in list(checkpoint_payload.get("task_ids", []) or [])
-            if str(item).strip()
+        requester_task_id = str(task_id or "").strip()
+        requester_session_id = str(session_id or "").strip()
+        linked_task_ids = {
+            str(checkpoint_payload.get("task_id") or "").strip(),
+            str(checkpoint_payload.get("waiting_task_id") or "").strip(),
+            str(getattr(checkpoint, "task_id", "") or "").strip(),
         }
-        if (
-            not checkpoint_task_id
-            or checkpoint_task_id != str(task_id or "").strip()
-            or not checkpoint_session_id
-            or checkpoint_session_id != str(session_id or "").strip()
-            or (payload_task_ids and str(task_id or "").strip() not in payload_task_ids)
+        linked_task_ids.update(
+            str(item or "").strip()
+            for item in list(checkpoint_payload.get("task_ids", []) or [])
+        )
+        linked_task_ids.discard("")
+        linked_session_ids = {
+            str(getattr(checkpoint, "session_id", "") or "").strip(),
+            str(checkpoint_payload.get("session_id") or "").strip(),
+        }
+        linked_session_ids.discard("")
+        has_linkage = bool(linked_task_ids or linked_session_ids)
+        if has_linkage and (
+            requester_task_id not in linked_task_ids
+            and (not requester_session_id or requester_session_id not in linked_session_ids)
         ):
             return False
         logger.info(
@@ -8801,26 +8807,50 @@ class WSHandler:
             from opc.core.models import TaskStatus
             task = await store.get_task(task_id)
             if task:
-                config_task = await self._resolve_session_runtime_config_task(
-                    task_id,
-                    task,
-                    engine=engine,
-                )
-                session_exec_mode, session_company_profile = self._resolve_task_session_config(
-                    config_task
-                )
-                session_org_id = self._resolve_task_org_id(config_task)
-                session_preferred_agent = self._resolve_task_preferred_agent(config_task)
-                if (
-                    session_exec_mode in {"org", "custom"}
-                    and not session_org_id
-                    and is_company_runtime_task(task)
-                ):
-                    raise ServiceError(
-                        "org_id_required",
-                        "org_id_required",
-                        {"project_id": pid, "task_id": task_id},
+                # This coroutine usually runs as a fire-and-forget background
+                # task (_track_session), where a raised ServiceError is only
+                # logged and the user's message silently vanishes. Fail closed
+                # with a visible chat error instead of raising.
+                try:
+                    config_task = await self._resolve_session_runtime_config_task(
+                        task_id,
+                        task,
+                        engine=engine,
                     )
+                    session_exec_mode, session_company_profile = self._resolve_task_session_config(
+                        config_task
+                    )
+                    session_org_id = self._resolve_task_org_id(config_task)
+                    session_preferred_agent = self._resolve_task_preferred_agent(config_task)
+                    if (
+                        session_exec_mode in {"org", "custom"}
+                        and not session_org_id
+                        and is_company_runtime_task(task)
+                    ):
+                        raise ServiceError(
+                            "org_id_required",
+                            "org_id_required",
+                            {"project_id": pid, "task_id": task_id},
+                        )
+                except ServiceError as exc:
+                    logger.warning(
+                        f"Session message for task {task_id} rejected during "
+                        f"runtime identity resolution: {exc.code}"
+                    )
+                    try:
+                        msg = await self.chat_store.insert_message(
+                            channel_id=channel_id,
+                            sender="system",
+                            sender_name="OPC",
+                            content=f"Error: {exc.message}",
+                            project_id=pid,
+                        )
+                        await self.broadcast({"type": "session_message", "payload": msg})
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "failed to surface session identity error"
+                        )
+                    return
 
         if await self._try_lock_free_parked_checkpoint_answer(
             task_id=task_id,
