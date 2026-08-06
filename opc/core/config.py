@@ -273,6 +273,7 @@ class LLMConfig(BaseModel):
     fallback: dict[str, Any] = Field(default_factory=dict)
     temperature: float = 0.3
     max_tokens: int = 32768
+    reasoning_effort: str | None = None
     # Total input context window (tokens) for the active model. Set this when
     # the model is not mapped in litellm (e.g. proxy/self-hosted models like
     # doubao/minimax/glm), so the context-usage ring and compaction thresholds
