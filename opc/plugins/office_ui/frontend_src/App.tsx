@@ -68,6 +68,16 @@ const SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS = new Set([
 ])
 
 type ThemeName = 'midnight' | 'neon' | 'paper' | 'retro' | 'terminal' | 'cozy' | 'openopc'
+const THEME_NAMES: readonly ThemeName[] = ['midnight', 'neon', 'paper', 'retro', 'terminal', 'cozy', 'openopc']
+const THEME_STORAGE_KEY = 'opc_office_theme'
+
+function loadStoredTheme(): ThemeName {
+  try {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY)
+    if (saved && (THEME_NAMES as readonly string[]).includes(saved)) return saved as ThemeName
+  } catch { /* private mode */ }
+  return 'openopc'
+}
 type AppPage = 'office' | 'workspace' | 'org' | 'mapEditor'
 type AppExecMode = 'task' | 'company' | 'org'
 
@@ -460,7 +470,7 @@ export default function App() {
   const [events, setEvents] = useState<VisualEvent[]>([])
   const [uiTick, setUiTick] = useState(0)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
-  const [theme, setTheme] = useState<ThemeName>('openopc')
+  const [theme, setTheme] = useState<ThemeName>(loadStoredTheme)
   const [showSubagents, setShowSubagents] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try { return localStorage.getItem('opc_office_sidebar_collapsed') === '1' } catch { return false }
@@ -2461,7 +2471,11 @@ export default function App() {
             <option value="day">{t('outdoor.day')}</option>
             <option value="night">{t('outdoor.night')}</option>
           </select>
-          <select className="theme-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemeName)}>
+          <select className="theme-select" value={theme} onChange={(e) => {
+            const next = e.target.value as ThemeName
+            setTheme(next)
+            try { localStorage.setItem(THEME_STORAGE_KEY, next) } catch { /* private mode */ }
+          }}>
             <option value="midnight">{t('theme.midnight')}</option>
             <option value="neon">{t('theme.neon')}</option>
             <option value="paper">{t('theme.paper')}</option>
