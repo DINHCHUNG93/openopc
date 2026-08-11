@@ -25,6 +25,8 @@ import { getExecutionTurnId } from './lib/workItemRuntimeIds'
 import { normalizeSessionCompanyProfile, normalizeSessionExecMode } from './lib/sessionIdentity'
 import { extractSessionRecruitmentByRole, sessionChannelId } from './lib/sessionRecruitment'
 import { resolveCanonicalTurnId, terminalAssistantTurnId } from './lib/turnIdentity'
+import { compileProjectIdPolicy, type ProjectIdPolicy } from './lib/projectIdPolicy'
+import { loadStoredTheme, saveStoredTheme, isThemeName, themeMessageKey, THEMES, type ThemeName } from './lib/theme'
 import { unassignAgent } from './game/map/OfficeStore'
 import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
 import { useI18n } from './i18n'
@@ -67,17 +69,6 @@ const SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS = new Set([
   'member_inbox_updated',
 ])
 
-type ThemeName = 'midnight' | 'neon' | 'paper' | 'retro' | 'terminal' | 'cozy' | 'openopc'
-const THEME_NAMES: readonly ThemeName[] = ['midnight', 'neon', 'paper', 'retro', 'terminal', 'cozy', 'openopc']
-const THEME_STORAGE_KEY = 'opc_office_theme'
-
-function loadStoredTheme(): ThemeName {
-  try {
-    const saved = localStorage.getItem(THEME_STORAGE_KEY)
-    if (saved && (THEME_NAMES as readonly string[]).includes(saved)) return saved as ThemeName
-  } catch { /* private mode */ }
-  return 'openopc'
-}
 type AppPage = 'office' | 'workspace' | 'org' | 'mapEditor'
 type AppExecMode = 'task' | 'company' | 'org'
 
@@ -470,6 +461,7 @@ export default function App() {
   const [events, setEvents] = useState<VisualEvent[]>([])
   const [uiTick, setUiTick] = useState(0)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [projectIdPolicy, setProjectIdPolicy] = useState<ProjectIdPolicy | null>(null)
   const [theme, setTheme] = useState<ThemeName>(loadStoredTheme)
   const [showSubagents, setShowSubagents] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -1152,6 +1144,7 @@ export default function App() {
           }
           // Handle project list response
           if (payload.ok && Array.isArray(payload.projects)) {
+            setProjectIdPolicy(compileProjectIdPolicy(payload.project_id_policy))
             const ps = projectStoreRef.current
             if (ps) {
               const previousActiveId = getActiveProjectId()
@@ -1223,6 +1216,7 @@ export default function App() {
       onStatus: (next, detail) => {
         setStatus(next)
         setStatusDetail(detail ?? '')
+        if (next !== 'connected') setProjectIdPolicy(null)
         if (next === 'connected') {
           const projectId = getActiveProjectId()
           client.listProjects()
@@ -2382,7 +2376,7 @@ export default function App() {
 
 
   return (
-    <div className={`app-shell theme-${theme}`}>
+    <div className="app-shell" data-theme={theme}>
       {orgToast && (
         <div className={`org-toast org-toast--${orgToast.kind}`} role="status" aria-live="polite">
           {orgToast.text}
@@ -2396,6 +2390,7 @@ export default function App() {
           <ProjectSelector
             projects={projectStore.projects}
             activeId={projectStore.activeProjectId}
+            projectIdPolicy={status === 'connected' ? projectIdPolicy : null}
             onSelect={(id) => {
               const switchSeq = beginProjectSwitch(id)
               clientRef.current?.switchProject(id, switchSeq)
@@ -2471,18 +2466,21 @@ export default function App() {
             <option value="day">{t('outdoor.day')}</option>
             <option value="night">{t('outdoor.night')}</option>
           </select>
-          <select className="theme-select" value={theme} onChange={(e) => {
-            const next = e.target.value as ThemeName
-            setTheme(next)
-            try { localStorage.setItem(THEME_STORAGE_KEY, next) } catch { /* private mode */ }
-          }}>
-            <option value="midnight">{t('theme.midnight')}</option>
-            <option value="neon">{t('theme.neon')}</option>
-            <option value="paper">{t('theme.paper')}</option>
-            <option value="retro">{t('theme.retro')}</option>
-            <option value="terminal">{t('theme.terminal')}</option>
-            <option value="cozy">{t('theme.cozy')}</option>
-            <option value="openopc">{t('theme.openopc')}</option>
+          <select
+            className="theme-select"
+            value={theme}
+            title={t('theme.label')}
+            aria-label={t('theme.label')}
+            onChange={(e) => {
+              const next = e.currentTarget.value
+              if (!isThemeName(next)) return
+              setTheme(next)
+              saveStoredTheme(next)
+            }}
+          >
+            {THEMES.map(({ name }) => (
+              <option key={name} value={name}>{t(themeMessageKey(name))}</option>
+            ))}
           </select>
           <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title={t('dev.tools')} aria-label={t('dev.tools')}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5.5 2L2 5.5 5.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.5 7L14 10.5 10.5 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>

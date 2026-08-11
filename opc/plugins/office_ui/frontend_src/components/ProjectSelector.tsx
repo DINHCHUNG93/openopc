@@ -1,34 +1,38 @@
-import { useState, useCallback, useMemo } from 'react'
+import { useState, useCallback, useId, useMemo } from 'react'
 import type { Project } from '../types/kanban'
 import { useI18n } from '../i18n'
-
-function toProjectSlug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
-}
+import { toProjectSlug, type ProjectIdPolicy } from '../lib/projectIdPolicy'
 
 interface ProjectSelectorProps {
   projects: Project[]
   activeId: string
+  projectIdPolicy: ProjectIdPolicy | null
   onSelect: (id: string) => void
   onCreate: (id: string) => void
   onDelete?: (id: string) => void
 }
 
-export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
+export function ProjectSelector({ projects, activeId, projectIdPolicy, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
   const { t } = useI18n()
+  const validationMessageId = useId()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
   const newSlug = useMemo(() => toProjectSlug(newName), [newName])
-  const nameInvalid = newName.trim().length > 0 && !newSlug
+  const hasName = newName.trim().length > 0
+  const slugValid = projectIdPolicy?.matches(newSlug) ?? false
+  const nameInvalid = hasName && projectIdPolicy !== null && !slugValid
+  const validationMessage = hasName && !slugValid
+    ? t(projectIdPolicy ? 'project.nameInvalid' : 'project.policyUnavailable')
+    : null
 
   const handleCreate = useCallback(() => {
-    if (!newSlug) return
+    if (!slugValid) return
     onCreate(newSlug)
     setNewName('')
     setCreating(false)
-  }, [newSlug, onCreate])
+  }, [newSlug, onCreate, slugValid])
 
   const handleDelete = useCallback(() => {
     if (!confirmDelete || !onDelete) return
@@ -62,30 +66,29 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
               placeholder={t('project.placeholder')}
               onChange={e => setNewName(e.target.value)}
               onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
-              aria-invalid={nameInvalid}
-              title={nameInvalid ? t('project.nameInvalid') : undefined}
-              style={{
-                width: 120,
-                ...(nameInvalid ? { borderColor: '#ef4444', outline: '1px solid #ef4444' } : {}),
-              }}
+              aria-invalid={nameInvalid || undefined}
+              aria-describedby={validationMessage ? validationMessageId : undefined}
+              title={validationMessage ?? undefined}
+              style={{ width: 120 }}
             />
-            {nameInvalid && (
-              <span style={{
-                position: 'absolute', top: '100%', left: 0, marginTop: 4,
-                fontSize: 10, lineHeight: 1.3, whiteSpace: 'nowrap',
-                color: '#ef4444', background: 'var(--bg-elevated)',
-                border: '1px solid var(--border)', borderRadius: 4,
-                padding: '2px 6px', zIndex: 100,
-              }}>
-                {t('project.nameInvalid')}
+            {validationMessage && (
+              <span
+                id={validationMessageId}
+                className="project-name-validation"
+                role="status"
+                aria-live="polite"
+              >
+                {validationMessage}
               </span>
             )}
           </span>
           <button
             type="submit"
             className="pill-btn"
-            disabled={!newSlug}
-            style={{ fontSize: 11, padding: '2px 8px', opacity: newSlug ? 1 : 0.5 }}
+            disabled={!slugValid}
+            aria-label={t('project.create')}
+            title={t('project.create')}
+            style={{ fontSize: 11, padding: '2px 8px', opacity: slugValid ? 1 : 0.5 }}
           >+</button>
         </form>
       ) : (
@@ -93,6 +96,7 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           className="pill-btn"
           onClick={() => setCreating(true)}
           title={t('project.new')}
+          aria-label={t('project.new')}
           style={{ fontSize: 11, padding: '2px 8px' }}
         >
           +
