@@ -1,6 +1,10 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import type { Project } from '../types/kanban'
 import { useI18n } from '../i18n'
+
+function toProjectSlug(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
+}
 
 interface ProjectSelectorProps {
   projects: Project[]
@@ -16,13 +20,15 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
   const [newName, setNewName] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
+  const newSlug = useMemo(() => toProjectSlug(newName), [newName])
+  const nameInvalid = newName.trim().length > 0 && !newSlug
+
   const handleCreate = useCallback(() => {
-    const id = newName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
-    if (!id) return
-    onCreate(id)
+    if (!newSlug) return
+    onCreate(newSlug)
     setNewName('')
     setCreating(false)
-  }, [newName, onCreate])
+  }, [newSlug, onCreate])
 
   const handleDelete = useCallback(() => {
     if (!confirmDelete || !onDelete) return
@@ -48,16 +54,39 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           onSubmit={e => { e.preventDefault(); handleCreate() }}
           style={{ display: 'flex', gap: 4 }}
         >
-          <input
-            autoFocus
-            className="theme-select"
-            value={newName}
-            placeholder={t('project.placeholder')}
-            onChange={e => setNewName(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
-            style={{ width: 120 }}
-          />
-          <button type="submit" className="pill-btn" style={{ fontSize: 11, padding: '2px 8px' }}>+</button>
+          <span style={{ position: 'relative', display: 'inline-flex' }}>
+            <input
+              autoFocus
+              className="theme-select"
+              value={newName}
+              placeholder={t('project.placeholder')}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
+              aria-invalid={nameInvalid}
+              title={nameInvalid ? t('project.nameInvalid') : undefined}
+              style={{
+                width: 120,
+                ...(nameInvalid ? { borderColor: '#ef4444', outline: '1px solid #ef4444' } : {}),
+              }}
+            />
+            {nameInvalid && (
+              <span style={{
+                position: 'absolute', top: '100%', left: 0, marginTop: 4,
+                fontSize: 10, lineHeight: 1.3, whiteSpace: 'nowrap',
+                color: '#ef4444', background: 'var(--bg-elevated)',
+                border: '1px solid var(--border)', borderRadius: 4,
+                padding: '2px 6px', zIndex: 100,
+              }}>
+                {t('project.nameInvalid')}
+              </span>
+            )}
+          </span>
+          <button
+            type="submit"
+            className="pill-btn"
+            disabled={!newSlug}
+            style={{ fontSize: 11, padding: '2px 8px', opacity: newSlug ? 1 : 0.5 }}
+          >+</button>
         </form>
       ) : (
         <button
