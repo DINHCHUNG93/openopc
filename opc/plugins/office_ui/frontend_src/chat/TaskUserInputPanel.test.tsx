@@ -85,11 +85,16 @@ assert.doesNotMatch(src, /localResponded|setLocalResponded/, 'panel must wait fo
 assert.match(src, /user_input_answers/, 'structured answers must be forwarded to the backend')
 
 const messageListSrc = readFileSync(join(here, 'MessageList.tsx'), 'utf8')
-const progressIndex = messageListSrc.indexOf("items.push({ kind: 'progress-block' })")
-const pendingIndex = messageListSrc.indexOf("items.push({ kind: 'pending-section' })")
-const endIndex = messageListSrc.indexOf("items.push({ kind: 'end-anchor' })")
-assert.ok(progressIndex !== -1 && pendingIndex !== -1 && endIndex !== -1)
-assert.ok(progressIndex < pendingIndex, 'pending checkpoint cards should render after the progress block')
-assert.ok(pendingIndex < endIndex, 'pending checkpoint cards should render before the end anchor')
+const timelineIndex = messageListSrc.indexOf('{processed.map(row => (')
+const progressIndex = messageListSrc.indexOf('{showProgressBlock && (')
+const endIndex = messageListSrc.indexOf('<div className="msg-end-anchor" />')
+assert.ok(timelineIndex !== -1 && progressIndex !== -1 && endIndex !== -1)
+assert.ok(timelineIndex < progressIndex && progressIndex < endIndex)
+assert.doesNotMatch(messageListSrc, /kind: 'pending-section'/, 'pending cards must not be moved into a second tail section')
+assert.match(
+  messageListSrc,
+  /Checkpoint cards never leave the chronological transcript/,
+  'task-user-input cards must remain at their creation position',
+)
 
 console.log('TaskUserInputPanel.test.tsx: OK (markdown and choice checkpoint panel)')

@@ -297,9 +297,11 @@ export function TaskDetailView({
           {linkedSession && linkedSessionMessages && linkedSessionMessages.length > 0 ? (
             <div className="task-detail-linked-messages">
               <MessageList
+                key={linkedSession.channelId}
                 messages={linkedSessionMessages}
                 channelName={linkedSession.title ?? 'Runtime Session'}
                 detailMode="summary"
+                scrollScope={linkedSession.channelId}
               />
             </div>
           ) : linkedSession ? (

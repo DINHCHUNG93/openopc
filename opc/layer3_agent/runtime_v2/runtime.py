@@ -19,10 +19,11 @@ from opc.core.models import OPCEvent, PermissionResolution, Task, TaskResult, Ta
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
 from opc.layer2_organization.work_item_identity import (
     projection_id_for_task,
+    result_delivery_identity_payload_for_task,
     turn_type_for_task,
     work_item_identity_payload_for_task,
 )
-from opc.layer3_agent.runtime_v2.permissions import ToolPermissionResolver
+from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
 from opc.layer3_agent.runtime_v2.subagents import ChildAgentFactory, SubagentManager
 from opc.layer3_agent.runtime_v2.tool_hooks import RuntimeToolHookBus, RuntimeToolHookContext
@@ -38,7 +39,7 @@ from opc.layer4_tools.output_budget import clip_text
 from opc.layer4_tools.registry import ToolDefinition
 from opc.layer4_tools.registry import ToolRegistry
 from opc.layer6_observability.cost_tracker import CostEntry
-from opc.llm.provider import LLMProvider
+from opc.llm.provider import LLMProvider, ProviderQuotaExhaustedError
 
 
 ApprovalCallback = Callable[[ToolDefinition, dict[str, Any], Optional[Task], Any], Awaitable[tuple[bool, Any]]]
@@ -69,6 +70,7 @@ class NativeRuntimeV2:
         config: OPCConfig | None = None,
         child_agent_factory: ChildAgentFactory | None = None,
         approval_callback: ApprovalCallback | None = None,
+        permission_policy: Any | None = None,
         prefetch_provider: PrefetchProvider | None = None,
     ) -> None:
         self.llm = llm
@@ -82,6 +84,9 @@ class NativeRuntimeV2:
         self.config = config or OPCConfig()
         self.child_agent_factory = child_agent_factory
         self.approval_callback = approval_callback
+        # The single permission policy (ApprovalEngine). Its sync predict()
+        # gates every tool call; ASK routes into approval_callback.
+        self.permission_policy = permission_policy
         self.prefetch_provider = prefetch_provider
         self._pre_tool_hooks: list[tuple[str, Any]] = []
         self._post_tool_hooks: list[tuple[str, Any]] = []
@@ -111,7 +116,6 @@ class NativeRuntimeV2:
             ensure_task_execution_context(task, self.config)
         runtime_session_id = self._runtime_session_id(task)
         conversation_turn_id = self._conversation_turn_id(task, runtime_session_id)
-        permission_session_id = self._permission_session_id(task, runtime_session_id)
         user_content = self.llm.prepare_user_message_content(
             user_message,
             attachment_refs=attachment_refs,
@@ -128,14 +132,10 @@ class NativeRuntimeV2:
             self.tools,
             max_parallel_read_tools=self.config.system.native_runtime.max_parallel_read_tools,
         )
-        permission_resolver = ToolPermissionResolver(
-            self.config.autonomy.permissions_v2,
-            store=getattr(self.memory_manager, "store", None),
-            runtime_session_id=permission_session_id,
-            project_id=task.project_id if task else "default",
-            llm=self.llm,
+        permission_resolver = RuntimePermissionAdapter(
+            self.permission_policy,
+            guardian=self.config.autonomy.permissions_v2.guardian,
         )
-        await permission_resolver.warmup()
         todo_state: list[dict[str, Any]] = self._restore_task_ledger(task)
         current_runtime_messages: list[dict[str, Any]] = []
         runtime_status: dict[str, Any] = {
@@ -264,12 +264,20 @@ class NativeRuntimeV2:
 
         total_cost = 0.0
         total_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+        last_observed_prompt_tokens = 0
         aggregated_artifacts: dict[str, Any] = {}
         overflow_retries = 0
         max_overflow_retries = max(
             1,
             int(self.config.system.native_runtime.reactive_compaction.max_overflow_retries or 1),
         ) if self.config.system.native_runtime.reactive_compaction.enabled else 1
+        # Unclassified provider failures (content filters, transient rejects)
+        # get bounded retries with the provider's error text fed back into the
+        # conversation so the model can adapt; the counter resets after every
+        # successful stream so long runs are not penalized for sporadic blips.
+        stream_error_feedback_retries = 0
+        max_stream_error_feedback_retries = 2
+        stream_error_context_reset_attempted = False
         compaction_boundaries: list[dict[str, Any]] = []
 
         await self._save_runtime_session(
@@ -365,6 +373,7 @@ class NativeRuntimeV2:
                 todo_state=todo_state,
                 runtime_notes=runtime_notes,
                 active_subagents=subagents.list_agents().get("agents", []),
+                observed_tokens=last_observed_prompt_tokens,
             )
             context_usage = await self._emit_context_usage(
                 runtime_session_id=runtime_session_id,
@@ -429,8 +438,13 @@ class NativeRuntimeV2:
                                     "canonical_turn_id": conversation_turn_id,
                                     "conversation_turn_id": conversation_turn_id,
                                     "execution_turn_id": execution_turn_id,
-                                    "item_id": f"{turn_id}:thinking",
-                                    "stream_id": f"{turn_id}:thinking",
+                                    # Keyed per iteration (like assistant_delta):
+                                    # thinking_delta_seq resets every iteration, so a
+                                    # turn-scoped stream id makes downstream seq guards
+                                    # drop iteration>=2 deltas and collapses all
+                                    # iterations into one entry (no tool interleaving).
+                                    "item_id": f"{execution_turn_id}:thinking",
+                                    "stream_id": f"{execution_turn_id}:thinking",
                                     "seq": thinking_delta_seq,
                                     "text": thinking_text,
                                 },
@@ -464,6 +478,8 @@ class NativeRuntimeV2:
                         prompt_tokens = int(event.payload.get("prompt_tokens", 0) or 0)
                         completion_tokens = int(event.payload.get("completion_tokens", 0) or 0)
                         estimated_cost_delta = float(event.payload.get("estimated_cost_delta", 0.0) or 0.0)
+                        if prompt_tokens:
+                            last_observed_prompt_tokens = prompt_tokens
                         total_usage["prompt_tokens"] += prompt_tokens
                         total_usage["completion_tokens"] += completion_tokens
                         total_cost += estimated_cost_delta
@@ -521,6 +537,23 @@ class NativeRuntimeV2:
                             },
                         )
             except Exception as exc:
+                rate_limit_checker = getattr(self.llm, "is_rate_limit_error", None)
+                if callable(rate_limit_checker) and rate_limit_checker(exc):
+                    # Quota/rate-limit rejections never reach the model, so
+                    # conversation-feedback retries cannot help — surface a
+                    # typed error for the dispatcher to park on instead of
+                    # burning retries and failing the work item (OBS-6).
+                    await self._cancel_early_tool_runs(early_tool_runs)
+                    await self._emit_runtime_event(
+                        runtime_session_id,
+                        task,
+                        "provider_quota_exhausted",
+                        {
+                            "iteration": iteration + 1,
+                            "message": str(exc)[:600],
+                        },
+                    )
+                    raise ProviderQuotaExhaustedError(str(exc)) from exc
                 if self.llm.is_context_overflow_error(exc) and overflow_retries < max_overflow_retries:
                     overflow_retries += 1
                     messages = await self._apply_context_pipeline(
@@ -534,6 +567,7 @@ class NativeRuntimeV2:
                         todo_state=todo_state,
                         runtime_notes=runtime_notes,
                         active_subagents=subagents.list_agents().get("agents", []),
+                        observed_tokens=last_observed_prompt_tokens,
                     )
                     continue
                 recovered_turn = await self._recover_tool_protocol_stream_error(
@@ -566,20 +600,55 @@ class NativeRuntimeV2:
                     )
                 else:
                     await self._cancel_early_tool_runs(early_tool_runs)
-                    truncated = self._truncate_to_last_clean_user_turn(messages, base_prefix_len)
-                    if truncated and len(truncated) > base_prefix_len:
+                    if self.llm.is_tool_protocol_error(exc):
+                        truncated = self._truncate_to_last_clean_user_turn(messages, base_prefix_len)
+                        if truncated and len(truncated) > base_prefix_len:
+                            await self._emit_runtime_event(
+                                runtime_session_id,
+                                task,
+                                "tool_protocol_retry",
+                                {
+                                    "iteration": iteration + 1,
+                                    "strategy": "truncate",
+                                    "message": str(exc),
+                                },
+                            )
+                            messages = truncated
+                            continue
+                    elif stream_error_feedback_retries < max_stream_error_feedback_retries:
+                        stream_error_feedback_retries += 1
+                        messages.append(self._provider_error_feedback_message(exc))
                         await self._emit_runtime_event(
                             runtime_session_id,
                             task,
                             "tool_protocol_retry",
                             {
                                 "iteration": iteration + 1,
-                                "strategy": "truncate",
+                                "strategy": "provider_error_feedback",
+                                "attempt": stream_error_feedback_retries,
                                 "message": str(exc),
                             },
                         )
-                        messages = truncated
                         continue
+                    elif not stream_error_context_reset_attempted:
+                        stream_error_context_reset_attempted = True
+                        truncated = self._truncate_to_last_clean_user_turn(messages, base_prefix_len)
+                        if truncated and base_prefix_len < len(truncated) < len(messages):
+                            truncated.append(
+                                self._provider_error_feedback_message(exc, context_reset=True)
+                            )
+                            await self._emit_runtime_event(
+                                runtime_session_id,
+                                task,
+                                "tool_protocol_retry",
+                                {
+                                    "iteration": iteration + 1,
+                                    "strategy": "provider_error_context_reset",
+                                    "message": str(exc),
+                                },
+                            )
+                            messages = truncated
+                            continue
                     await self._emit_runtime_event(
                         runtime_session_id,
                         task,
@@ -607,6 +676,7 @@ class NativeRuntimeV2:
                         token_usage=total_usage,
                     )
 
+            stream_error_feedback_retries = 0
             tool_calls = self._finalize_tool_calls(tool_call_chunks)
             assistant_message = {"role": "assistant", "content": assistant_text}
             if tool_calls:
@@ -656,6 +726,14 @@ class NativeRuntimeV2:
                     runtime_notes=runtime_notes,
                 )
                 if verification_gate is not None:
+                    verification_gate.artifacts = {
+                        **dict(verification_gate.artifacts or {}),
+                        "runtime_session_id": runtime_session_id,
+                        **result_delivery_identity_payload_for_task(
+                            task,
+                            canonical_turn_id=conversation_turn_id,
+                        ),
+                    }
                     await self._save_runtime_session(
                         runtime_session_id,
                         task,
@@ -681,6 +759,10 @@ class NativeRuntimeV2:
                 artifacts = {
                     **aggregated_artifacts,
                     "runtime_session_id": runtime_session_id,
+                    **result_delivery_identity_payload_for_task(
+                        task,
+                        canonical_turn_id=conversation_turn_id,
+                    ),
                     "permission_requests": self._permission_requests_from_results([]),
                     "active_subagents": active_subagents,
                     "compaction_boundaries": list(compaction_boundaries),
@@ -754,7 +836,6 @@ class NativeRuntimeV2:
                 compaction_boundaries=compaction_boundaries,
                 active_subagents=active_subagents,
             )
-            await self._persist_permission_grants(permission_session_id, task, execution_results)
             early_return = self._handle_pause_or_peer_wait(
                 execution_results,
                 aggregated_artifacts,
@@ -919,18 +1000,12 @@ class NativeRuntimeV2:
             normalized_turn_id = f"turn:{uuid.uuid4().hex}"
         return f"{normalized_turn_id}:iter:{iteration + 1}"
 
-    def _permission_session_id(self, task: Task | None, runtime_session_id: str) -> str:
-        if not task:
-            return runtime_session_id
-        bridged = str(task.metadata.get("_permission_bridge_runtime_session_id", "") or "").strip()
-        return bridged or runtime_session_id
-
     def _build_tool_hook_bus(
         self,
         *,
         runtime_session_id: str,
         task: Task | None,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         on_progress: Any = None,
     ) -> RuntimeToolHookBus:
         hook_bus = RuntimeToolHookBus(
@@ -965,18 +1040,10 @@ class NativeRuntimeV2:
         self,
         context: RuntimeToolHookContext,
         *,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         on_progress: Any = None,
     ) -> dict[str, Any] | None:
         predicted = context.predicted_permission
-        if predicted is not None and context.tool is not None:
-            predicted = await permission_resolver.refine_decision(
-                predicted,
-                tool=context.tool,
-                arguments=context.arguments,
-                task=context.task,
-            )
-            context.predicted_permission = predicted
         if predicted is not None and getattr(predicted, "resolution", None) == PermissionResolution.DENY:
             return {
                 "result": permission_resolver.build_blocked_result(
@@ -1459,7 +1526,7 @@ class NativeRuntimeV2:
         early_tool_runs: dict[int, dict[str, Any]],
         executor: StreamingToolExecutor,
         planner: ToolPlanner,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         task: Task | None,
         on_progress: Any,
         runtime_session_id: str,
@@ -1495,7 +1562,7 @@ class NativeRuntimeV2:
         self,
         *,
         planner: ToolPlanner,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         call: dict[str, Any],
         task: Task | None,
     ) -> bool:
@@ -1697,6 +1764,41 @@ class NativeRuntimeV2:
                     break
         return None
 
+    @staticmethod
+    def _provider_error_feedback_message(
+        exc: Exception,
+        *,
+        context_reset: bool = False,
+    ) -> dict[str, str]:
+        """Conversation message telling the model why the last request failed.
+
+        Unclassified provider rejections (content filters, transient 4xx) never
+        produce model output, so without this the model has no way to know the
+        request failed or why. Feeding the provider's own error text back lets
+        the model decide how to proceed (rephrase, drop a quote, change tack)
+        instead of the runtime blindly replaying an identical payload.
+        """
+        error_text = " ".join(str(exc).split())[:600]
+        if context_reset:
+            detail = (
+                "The previous LLM request kept failing at the model provider, so the "
+                "intermediate steps of the current turn were dropped from the request."
+            )
+        else:
+            detail = (
+                "The previous LLM request failed at the model provider before any "
+                "output was produced."
+            )
+        return {
+            "role": "system",
+            "content": (
+                f"[runtime notice] {detail} Provider error: {error_text}. "
+                "This was not a user action. Adjust your next step accordingly — for "
+                "example rephrase sensitive wording, avoid quoting flagged content "
+                "verbatim, or choose another way to make progress — then continue the task."
+            ),
+        }
+
     def _truncate_to_last_clean_user_turn(
         self,
         messages: list[dict[str, Any]],
@@ -1723,21 +1825,47 @@ class NativeRuntimeV2:
         runtime_notes: dict[str, Any],
         active_subagents: list[dict[str, Any]],
         force_compact: bool = False,
+        observed_tokens: int = 0,
     ) -> list[dict[str, Any]]:
+        # History below the hard threshold is never rewritten: model quality
+        # and prompt-cache prefixes both depend on old messages staying
+        # byte-identical. The only routine mutation is the idempotent
+        # per-message tool-result budget (same clip an entry already got).
         bounded = self._apply_tool_result_budget(messages)
-        apply_soft_compaction = force_compact or self._should_apply_soft_compaction(bounded, tool_schemas)
-        microcompacted = self._apply_tool_aware_microcompact(bounded, base_prefix_len) if apply_soft_compaction else bounded
-        compacted = await self._apply_durable_compaction(
-            microcompacted,
-            tool_schemas=tool_schemas,
-            task=task,
-            force_compact=force_compact or self._should_apply_hard_compaction(microcompacted, tool_schemas),
+        pipeline_steps = ["tool_result_budgeting"]
+        compacted = bounded
+        durable_applied = False
+        wants_compaction = force_compact or self._should_apply_hard_compaction(
+            bounded, tool_schemas, observed_tokens=observed_tokens
         )
+        if wants_compaction:
+            breaker_limit = max(
+                1,
+                int(self.config.system.native_runtime.reactive_compaction.circuit_breaker_failures or 2),
+            )
+            failures = int(runtime_notes.get("durable_compaction_failures", 0) or 0)
+            if failures < breaker_limit:
+                compacted, durable_applied = await self._apply_durable_compaction(
+                    bounded,
+                    task=task,
+                    base_prefix_len=base_prefix_len,
+                    runtime_session_id=runtime_session_id,
+                )
+                if durable_applied:
+                    pipeline_steps.append("durable_compaction")
+                    runtime_notes["durable_compaction_failures"] = 0
+                else:
+                    runtime_notes["durable_compaction_failures"] = failures + 1
+            if not durable_applied and force_compact:
+                # Emergency-only mechanical fallback: overflow pressure with
+                # the summarizing compactor unavailable or circuit-broken.
+                compacted = self._apply_tool_aware_microcompact(compacted, base_prefix_len)
+                pipeline_steps.append("emergency_microcompact")
         if compacted != bounded:
             boundary_record = {
                 "summary": "Runtime V2 context pipeline compacted persisted history.",
                 "message_count": len(compacted),
-                "pipeline": ["tool_result_budgeting", "tool_aware_microcompact", "durable_compaction", "session_memory_reinjection"],
+                "pipeline": [*pipeline_steps, "session_memory_reinjection"],
             }
             compaction_boundaries.append(boundary_record)
             store = getattr(self.memory_manager, "store", None)
@@ -1776,9 +1904,18 @@ class NativeRuntimeV2:
             if message.get("role") == "tool":
                 content = str(message.get("content", "") or "")
                 if len(content) > budget:
+                    # Keep head and tail: openings carry the command/context,
+                    # endings carry the verdict (exit codes, tracebacks).
+                    head = max(1, budget // 2)
+                    tail = max(0, budget - head)
+                    omitted = len(content) - head - tail
                     compacted.append({
                         **message,
-                        "content": content[:budget] + "\n[tool result truncated by runtime_v2]",
+                        "content": (
+                            content[:head]
+                            + f"\n[tool result truncated by runtime_v2: {omitted} chars omitted]\n"
+                            + (content[-tail:] if tail else "")
+                        ),
                     })
                     continue
             compacted.append(message)
@@ -1927,18 +2064,106 @@ class NativeRuntimeV2:
             })
         return compacted
 
+    _DURABLE_COMPACTION_MARKER = "[runtime_v2 durable compaction]"
+
     async def _apply_durable_compaction(
         self,
         messages: list[dict[str, Any]],
         *,
-        tool_schemas: list[dict[str, Any]] | None,
         task: Task | None,
-        force_compact: bool = False,
-    ) -> list[dict[str, Any]]:
-        _ = tool_schemas
-        _ = task
-        _ = force_compact
-        return messages
+        base_prefix_len: int,
+        runtime_session_id: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Fold old messages into one LLM summary, keeping prefix and tail.
+
+        Returns (messages, applied). On any summarizer failure the original
+        list is returned unchanged so the caller can count failures and the
+        model keeps seeing the full history for this round.
+        """
+        compactor = self.history_compactor
+        summarize = getattr(compactor, "summarize_runtime_history", None) if compactor else None
+        if not callable(summarize):
+            return messages, False
+        preserve_recent = max(
+            4,
+            int(self.config.system.native_runtime.tool_aware_microcompact.preserve_recent_messages or 8),
+        )
+        start = max(base_prefix_len, len(messages) - preserve_recent)
+        # Never split an assistant tool_calls message from its tool results.
+        while start > base_prefix_len and str(messages[start].get("role", "") or "") == "tool":
+            start -= 1
+        # base_prefix_len goes stale once session-memory/artifact messages are
+        # injected into the prefix region, shifting real prefix messages past
+        # the boundary. Never fold the system head, and keep the seed user
+        # request verbatim on every round (Codex-style): a previous summary is
+        # a user message too, but carries the marker and must stay foldable so
+        # exactly one summary exists at a time.
+        fold_start = base_prefix_len
+        while fold_start < start and str(messages[fold_start].get("role", "") or "") == "system":
+            fold_start += 1
+        if (
+            fold_start < start
+            and str(messages[fold_start].get("role", "") or "") == "user"
+            and self._DURABLE_COMPACTION_MARKER not in str(messages[fold_start].get("content", "") or "")
+            and not any(str(item.get("role", "") or "") == "user" for item in messages[:fold_start])
+        ):
+            fold_start += 1
+        folded = messages[fold_start:start]
+        if len(folded) < 4:
+            return messages, False
+        try:
+            summary = await summarize(
+                project_id=str(getattr(task, "project_id", "") or ""),
+                session_id=runtime_session_id,
+                messages=self._render_messages_for_compaction(folded),
+            )
+        except Exception as exc:
+            logger.warning(f"Durable compaction failed; keeping full history this round: {exc}")
+            return messages, False
+        summary_text = str(summary or "").strip()
+        if not summary_text:
+            return messages, False
+        summary_message = {
+            "role": "user",
+            "content": (
+                f"{self._DURABLE_COMPACTION_MARKER} Earlier conversation was compacted to stay "
+                "within the context window. Continue seamlessly from this summary; the full "
+                "transcript remains persisted and queryable.\n\n" + summary_text
+            ),
+        }
+        return [*messages[:fold_start], summary_message, *messages[start:]], True
+
+    def _render_messages_for_compaction(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        per_message_budget = 4_000
+        rendered: list[dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role", "") or "assistant")
+            content = str(message.get("content", "") or "")
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                names: list[str] = []
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function", "")
+                    name = function.get("name", "") if isinstance(function, dict) else str(function or "")
+                    if name:
+                        names.append(str(name))
+                if names:
+                    content = (content + "\n[called tools: " + ", ".join(names) + "]").strip()
+            if role == "tool":
+                content = f"[tool result {str(message.get('tool_call_id', '') or '')}] {content}".strip()
+            if len(content) > per_message_budget:
+                head = per_message_budget // 2
+                tail = per_message_budget - head - 100
+                content = (
+                    content[:head]
+                    + f"\n[{len(content) - head - tail} chars omitted]\n"
+                    + content[-tail:]
+                )
+            if content:
+                rendered.append({"role": role, "content": content})
+        return rendered
 
     async def _reinject_session_memory(
         self,
@@ -2732,9 +2957,24 @@ class NativeRuntimeV2:
             "runtime_session_id": runtime_session_id,
             "source_kind": source_kind,
         }
+        if not tool_calls:
+            metadata.update(
+                result_delivery_identity_payload_for_task(
+                    task,
+                    canonical_turn_id=canonical_turn_id,
+                )
+            )
+            metadata.update(work_item_identity_payload_for_task(task))
+            if task.session_id:
+                metadata["child_session_id"] = str(task.session_id)
         if is_company_mode:
             metadata["execution_mode"] = "company_mode"
             metadata["company_runtime_raw_turn"] = True
+            if not tool_calls:
+                # Terminal iteration of the company turn — this is the role's
+                # final reply. Marked so the UI can show it at summary detail
+                # even though the kind is otherwise full-detail-only.
+                metadata["company_final_turn"] = True
             if task.assigned_to:
                 metadata["role_id"] = str(task.assigned_to)
         else:
@@ -2746,7 +2986,15 @@ class NativeRuntimeV2:
             if message_turn_id and message_turn_id != canonical_turn_id:
                 metadata["execution_turn_id"] = message_turn_id
             if is_company_mode:
-                metadata["ui_message_id"] = f"runtime-v2-company-assistant:{canonical_turn_id}"
+                # Tool-calling iterations of a company conversation turn share
+                # one UI row; the terminal reply gets its own id. The id-keyed
+                # backfill merge keeps the first-inserted content for same-kind
+                # candidates, so reusing the shared id freezes the row at
+                # iteration 1 and swallows the final reply entirely.
+                if metadata.get("company_final_turn"):
+                    metadata["ui_message_id"] = f"runtime-v2-company-assistant-final:{canonical_turn_id}"
+                else:
+                    metadata["ui_message_id"] = f"runtime-v2-company-assistant:{canonical_turn_id}"
             elif is_intermediate_tool_turn:
                 metadata["ui_message_id"] = f"runtime-v2-intermediate-assistant:{message_turn_id or canonical_turn_id}"
             else:
@@ -3521,8 +3769,16 @@ class NativeRuntimeV2:
         self,
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]] | None,
+        *,
+        observed_tokens: int = 0,
     ) -> dict[str, Any]:
-        token_count = self._safe_count_input_tokens(messages, tool_schemas)
+        # Anchor on the provider-reported prompt size of the latest request
+        # when it exceeds the local estimate: the context only grows within a
+        # turn, so max() protects against estimator undercounting.
+        token_count = max(
+            self._safe_count_input_tokens(messages, tool_schemas),
+            int(observed_tokens or 0),
+        )
         context_window = self._context_window_limit()
         remaining_tokens = max(0, context_window - token_count) if context_window > 0 else 0
         remaining_pct = int((remaining_tokens / context_window) * 100) if context_window > 0 else 0
@@ -3534,35 +3790,23 @@ class NativeRuntimeV2:
             "context_remaining_tokens": remaining_tokens,
             "context_remaining_pct": remaining_pct,
             "usage_ratio": round(usage_ratio, 4),
-            "soft_threshold": float(self.config.system.native_runtime.context_guard.soft_threshold or 0.60),
-            "hard_threshold": float(self.config.system.native_runtime.context_guard.hard_threshold or 0.80),
+            "hard_threshold": float(self.config.system.native_runtime.context_guard.hard_threshold or 0.90),
         }
-
-    def _should_apply_soft_compaction(
-        self,
-        messages: list[dict[str, Any]],
-        tool_schemas: list[dict[str, Any]] | None,
-    ) -> bool:
-        config = self.config.system.native_runtime.context_guard
-        if not config.enabled:
-            return True
-        payload = self._context_usage_payload(messages, tool_schemas)
-        if payload["context_window"] <= 0:
-            return len(messages) > self.config.system.native_runtime.history_snip_trigger_messages
-        return float(payload["usage_ratio"]) >= float(config.soft_threshold or 0.60)
 
     def _should_apply_hard_compaction(
         self,
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]] | None,
+        *,
+        observed_tokens: int = 0,
     ) -> bool:
         config = self.config.system.native_runtime.context_guard
         if not config.enabled:
             return False
-        payload = self._context_usage_payload(messages, tool_schemas)
+        payload = self._context_usage_payload(messages, tool_schemas, observed_tokens=observed_tokens)
         if payload["context_window"] <= 0:
             return False
-        return float(payload["usage_ratio"]) >= float(config.hard_threshold or 0.80)
+        return float(payload["usage_ratio"]) >= float(config.hard_threshold or 0.90)
 
     def _clip_tool_result_for_history(
         self,
@@ -3774,54 +4018,6 @@ class NativeRuntimeV2:
         except TypeError:
             await callback(text)
 
-    async def _persist_permission_grants(
-        self,
-        runtime_session_id: str,
-        task: Task | None,
-        execution_results: list[dict[str, Any]],
-    ) -> None:
-        store = getattr(self.memory_manager, "store", None)
-        if not store or not hasattr(store, "save_runtime_permission_grant"):
-            return
-        for item in execution_results:
-            decision = item.get("permission_decision")
-            result = item.get("result", {})
-            call = item.get("tool_call", {})
-            if decision is None:
-                continue
-            human_reply = str(
-                (result.get("approval", {}) or {}).get("human_reply")
-                or ""
-            ).strip().lower()
-            if human_reply not in {"approve_session", "always_project", "always_global"}:
-                continue
-            candidate = (
-                str(call.get("arguments", {}).get("path", "") or "").strip()
-                or str(call.get("arguments", {}).get("command", "") or "").strip()
-                or "*"
-            )
-            execution_context = dict((getattr(task, "metadata", {}) or {}).get("_execution_context", {}) or {}) if task else {}
-            sandbox = dict(execution_context.get("sandbox", {}) or {})
-            scope = "session"
-            if human_reply == "always_project":
-                scope = "project"
-            elif human_reply == "always_global":
-                scope = "global"
-            metadata = dict(result.get("approval", {}) or {})
-            metadata.update({
-                "sandbox_mode": str(sandbox.get("mode", "") or "").strip() or "*",
-                "allow_network": str(bool(sandbox.get("allow_network", True))).lower(),
-                "workspace_class": "workspace" if str((getattr(task, "metadata", {}) or {}).get("target_output_dir", "") or "").strip() else "default",
-            })
-            await store.save_runtime_permission_grant(
-                runtime_session_id=runtime_session_id,
-                project_id=task.project_id if task else "default",
-                scope=scope,
-                tool_name=str(call.get("function", "") or ""),
-                candidate=candidate,
-                metadata=metadata,
-            )
-
     def _permission_requests_from_results(self, execution_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         requests: list[dict[str, Any]] = []
         for item in execution_results:
@@ -3833,8 +4029,15 @@ class NativeRuntimeV2:
             resolution_value = getattr(resolution, "value", str(resolution))
             if resolution_value not in {"ask", "deny"}:
                 continue
+            raw_arguments = call.get("arguments")
             requests.append({
                 "tool_name": str(call.get("function", "") or ""),
+                # The blocked call's arguments must survive into the park
+                # checkpoint: a late approval reply rebuilds the allowlist
+                # context from them, and without the command text no grant can
+                # be recorded — the task resumes, retries, re-blocks, and
+                # re-parks on an identical card forever.
+                "tool_args": dict(raw_arguments) if isinstance(raw_arguments, dict) else {},
                 "resolution": resolution_value,
                 "scope": getattr(getattr(decision, "scope", None), "value", str(getattr(decision, "scope", ""))),
                 "risk_level": getattr(getattr(decision, "risk_level", None), "value", str(getattr(decision, "risk_level", ""))),

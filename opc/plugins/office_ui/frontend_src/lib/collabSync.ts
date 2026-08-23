@@ -15,6 +15,17 @@ const UNIX_MS_THRESHOLD = 1_000_000_000_000
 const WORK_ITEM_EVENT_RE = /^\[Company:([^\]]+)\]\s*(.*)$/
 const COMPANY_RUNTIME_EVENT_RE = /^\[Company\]\s*(.*)$/
 
+export function mergeSessionDetailHasMore(
+  previous: boolean | undefined,
+  incoming: boolean,
+  isHistoryPage: boolean,
+): boolean {
+  // A latest-page refresh only describes that 200-row response. It must not
+  // reopen an older-history cursor that the user already exhausted.
+  if (!isHistoryPage && previous === false) return false
+  return incoming
+}
+
 function normalizeAgentRuntimeStatus(rawStatus: unknown, rawAgentStatus: unknown): AgentAnimStatus | undefined {
   if (rawAgentStatus === 'idle' || rawAgentStatus === 'reflecting' || rawAgentStatus === 'tool_active') {
     return rawAgentStatus
@@ -51,6 +62,16 @@ function mapBackendProgressLog(raw: any): ProgressEntry[] {
         ? entry.stream_id
         : typeof entry.streamId === 'string'
           ? entry.streamId
+          : undefined,
+      toolCallId: typeof entry.tool_call_id === 'string'
+        ? entry.tool_call_id
+        : typeof entry.toolCallId === 'string'
+          ? entry.toolCallId
+          : undefined,
+      permissionGroupKey: typeof entry.permission_group_key === 'string'
+        ? entry.permission_group_key
+        : typeof entry.permissionGroupKey === 'string'
+          ? entry.permissionGroupKey
           : undefined,
       seq: typeof entry.seq === 'number' && Number.isFinite(entry.seq) ? entry.seq : undefined,
       executionMode: typeof entry.execution_mode === 'string'
@@ -633,6 +654,8 @@ export function mapBackendSession(raw: any): Session {
     detailLoaded: raw.detail_loaded ?? raw.detailLoaded,
     fullLoaded: raw.full_loaded ?? raw.fullLoaded,
     hasMore: raw.has_more ?? raw.hasMore,
+    summaryHasMore: raw.summary_has_more ?? raw.summaryHasMore,
+    fullHasMore: raw.full_has_more ?? raw.fullHasMore,
     detailLoading: raw.detail_loading ?? raw.detailLoading,
     detailError: raw.detail_error ?? raw.detailError,
     viewGeneration: raw.view_generation ?? raw.viewGeneration,
@@ -653,7 +676,6 @@ export function mapBackendSession(raw: any): Session {
     runtimeControlState: raw.runtime_control_state ?? raw.runtimeControlState,
     canStop: raw.can_stop ?? raw.canStop,
     canResume: raw.can_resume ?? raw.canResume,
-    resumeParentTaskId: raw.resume_parent_task_id ?? raw.resumeParentTaskId,
     resumeParentSessionId: raw.resume_parent_session_id ?? raw.resumeParentSessionId,
     pendingRuntimeCheckpointId: raw.pending_runtime_checkpoint_id ?? raw.pendingRuntimeCheckpointId,
     stopIntentId: raw.stop_intent_id ?? raw.stopIntentId,

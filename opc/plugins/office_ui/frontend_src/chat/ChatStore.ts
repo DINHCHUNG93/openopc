@@ -1,5 +1,6 @@
-import { useCallback, useMemo, useReducer, useState } from 'react'
+import { useCallback, useMemo, useReducer, useRef, useState } from 'react'
 import type { ChatChannel, ChatMessage } from '../types/chat'
+import { stableMessageTimelineKey } from '../lib/messageTimelineIdentity'
 
 function uid(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
@@ -22,8 +23,8 @@ function messageMetadata(message: ChatMessage): Record<string, unknown> {
   return (message.metadata ?? {}) as Record<string, unknown>
 }
 
-function normalizeMessageContent(content: string): string {
-  const normalized = String(content ?? '')
+function normalizeMessageFormatting(content: string): string {
+  return String(content ?? '')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')
@@ -31,6 +32,10 @@ function normalizeMessageContent(content: string): string {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function normalizeMessageContent(content: string): string {
+  const normalized = normalizeMessageFormatting(content)
   const titleStripped = stripNarrativeTitlePrefix(normalized)
   const paragraphs = titleStripped.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
   if (paragraphs.length > 1 && /^Verification:\s/i.test(paragraphs[paragraphs.length - 1])) {
@@ -40,21 +45,40 @@ function normalizeMessageContent(content: string): string {
 }
 
 function stripNarrativeTitlePrefix(content: string): string {
-  const trimmed = String(content || '').trim()
-  const markdownTitle = trimmed.match(/^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$/)
-  if (markdownTitle) {
+  let trimmed = String(content || '').trim()
+  // Only an explicit, first-line "**Title**: body" wrapper is removable.
+  // Searching for an arbitrary `: ` in the first N characters is destructive:
+  // ordinary Markdown such as "**Work Item 1: ...**" and list fields such as
+  // "- ID: ..." would be peeled one layer at a time on repeated syncs.
+  for (;;) {
+    const markdownTitle = trimmed.match(/^\*\*([^\r\n]{8,160}?)\*\*:(?:[ \t]+|\r?\n+)([\s\S]+)$/)
+    if (!markdownTitle) return trimmed
     const body = markdownTitle[2].trim()
-    if (body.length >= 80) return body
+    if (body.length < 80 || body === trimmed) return trimmed
+    trimmed = body
   }
-  const colonIndex = trimmed.indexOf(': ')
-  if (colonIndex < 8 || colonIndex > 160) return trimmed
+}
 
-  const prefix = trimmed.slice(0, colonIndex).replace(/\*/g, '').trim()
-  const body = trimmed.slice(colonIndex + 2).trim()
-  if (body.length < 80) return trimmed
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(prefix)) return trimmed
-  if (/^(https?|file)$/i.test(prefix)) return trimmed
-  return body
+function losslessIdentityContent(
+  existing: ChatMessage,
+  candidate: ChatMessage,
+  preferred: ChatMessage,
+  sharesConcreteIdentity: boolean,
+): string {
+  if (!sharesConcreteIdentity) return preferred.content
+
+  const existingComparable = normalizeMessageFormatting(existing.content)
+  const candidateComparable = normalizeMessageFormatting(candidate.content)
+  if (!existingComparable || !candidateComparable || existingComparable === candidateComparable) {
+    return preferred.content
+  }
+
+  // A cache/detail replay can contain a prefix-truncated copy of the same
+  // persistent message. Preserve the lossless source regardless of arrival
+  // order; unrelated edits still follow the normal preference rules.
+  if (existingComparable.endsWith(candidateComparable)) return existing.content
+  if (candidateComparable.endsWith(existingComparable)) return candidate.content
+  return preferred.content
 }
 
 function messageIdentityKeys(message: ChatMessage): Set<string> {
@@ -65,6 +89,9 @@ function messageIdentityKeys(message: ChatMessage): Set<string> {
   for (const value of [
     message.id,
     typeof metadata.ui_message_id === 'string' ? metadata.ui_message_id : '',
+    typeof metadata.result_delivery_id === 'string' && metadata.result_delivery_id.trim()
+      ? `delivery:${metadata.result_delivery_id.trim()}`
+      : '',
     checkpointType && checkpointId ? `checkpoint:${checkpointType}:${checkpointId}` : '',
   ]) {
     const normalized = String(value ?? '').trim()
@@ -73,12 +100,64 @@ function messageIdentityKeys(message: ChatMessage): Set<string> {
   return keys
 }
 
+function scopedMessageIdentityKeys(message: ChatMessage): Set<string> {
+  return new Set(
+    [...messageIdentityKeys(message)].map(key => `${message.channelId}\u0000${key}`),
+  )
+}
+
 function isDerivedIdentityKey(value: string): boolean {
-  return value.startsWith('checkpoint:')
+  return value.startsWith('checkpoint:') || value.startsWith('delivery:')
 }
 
 function messageTimestamp(message: ChatMessage): number {
   return typeof message.timestamp === 'number' ? message.timestamp : 0
+}
+
+function isOptimisticMessage(message: ChatMessage): boolean {
+  return String(message.id ?? '').startsWith('msg-')
+}
+
+function isPersistentMessage(message: ChatMessage): boolean {
+  // sendMessage creates client-only optimistic rows with this prefix. Once the
+  // backend acknowledges one, message deduplication replaces its identity with
+  // the persistent ui_message_id / backend message id.
+  return !isOptimisticMessage(message)
+}
+
+function latestPersistentMessageTimestamps(messages: ChatMessage[]): Record<string, number> {
+  const latest: Record<string, number> = {}
+  for (const message of messages) {
+    if (!isPersistentMessage(message)) continue
+    const timestamp = messageTimestamp(message)
+    if (timestamp > (latest[message.channelId] ?? 0)) {
+      latest[message.channelId] = timestamp
+    }
+  }
+  return latest
+}
+
+function advanceReadTimestamp(
+  state: Record<string, number>,
+  channelId: string,
+  timestamp: number,
+): Record<string, number> {
+  if (timestamp <= (state[channelId] ?? 0)) return state
+  return { ...state, [channelId]: timestamp }
+}
+
+function unreadMessageCounts(
+  messages: ChatMessage[],
+  readTimestamps: Record<string, number>,
+): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const message of messages) {
+    if (!isPersistentMessage(message) || message.sender === 'user') continue
+    const lastRead = readTimestamps[message.channelId] ?? 0
+    if (messageTimestamp(message) <= lastRead) continue
+    counts[message.channelId] = (counts[message.channelId] ?? 0) + 1
+  }
+  return counts
 }
 
 function messageRoleBucket(message: ChatMessage): 'user' | 'assistant' {
@@ -154,7 +233,12 @@ function mergeDuplicateMessages(
   let preferred = existing
   let secondary = candidate
 
-  if (preferCandidate) {
+  const existingOptimistic = isOptimisticMessage(existing)
+  const candidateOptimistic = isOptimisticMessage(candidate)
+  if (existingOptimistic !== candidateOptimistic) {
+    preferred = existingOptimistic ? candidate : existing
+    secondary = existingOptimistic ? existing : candidate
+  } else if (preferCandidate) {
     preferred = candidate
     secondary = existing
   } else if (messagePreferenceScore(candidate) > messagePreferenceScore(existing)) {
@@ -171,27 +255,42 @@ function mergeDuplicateMessages(
 
   const existingIds = messageIdentityKeys(existing)
   const candidateIds = messageIdentityKeys(candidate)
+  let sharesConcreteIdentity = false
   let canonicalId = ''
   for (const id of existingIds) {
-    if (candidateIds.has(id) && !isDerivedIdentityKey(id)) {
-      canonicalId = id
-      break
+    if (!candidateIds.has(id)) continue
+    if (!isDerivedIdentityKey(id)) {
+      sharesConcreteIdentity = true
+      if (!canonicalId) canonicalId = id
     }
   }
 
-  const normalizedContent = normalizeMessageContent(preferred.content)
-  const content = normalizedContent && normalizedContent === normalizeMessageContent(secondary.content)
-    ? normalizedContent
-    : preferred.content
+  const content = losslessIdentityContent(existing, candidate, preferred, sharesConcreteIdentity)
+
+  const existingCheckpointId = String(messageMetadata(existing).checkpoint_id ?? '').trim()
+  const candidateCheckpointId = String(messageMetadata(candidate).checkpoint_id ?? '').trim()
+  const preservesCheckpointPosition = !!existingCheckpointId && existingCheckpointId === candidateCheckpointId
+  const replacesResultSurface = isResultSurface(existing) && isResultSurface(candidate)
+  const retainedTimelineId = replacesResultSurface
+    ? String(
+      messageMetadata(existing).ui_timeline_id
+      ?? messageMetadata(candidate).ui_timeline_id
+      ?? stableMessageTimelineKey(existing),
+    ).trim()
+    : ''
+  const mergedMetadata = { ...messageMetadata(secondary), ...messageMetadata(preferred) }
+  if (retainedTimelineId) mergedMetadata.ui_timeline_id = retainedTimelineId
 
   return {
     ...secondary,
     ...preferred,
     ...(canonicalId ? { id: canonicalId } : {}),
     content,
-    metadata: { ...messageMetadata(secondary), ...messageMetadata(preferred) },
+    metadata: mergedMetadata,
     mentions,
-    timestamp: messageTimestamp(preferred) || messageTimestamp(secondary),
+    timestamp: preservesCheckpointPosition || replacesResultSurface
+      ? messageTimestamp(existing) || messageTimestamp(candidate)
+      : messageTimestamp(preferred) || messageTimestamp(secondary),
   }
 }
 
@@ -201,7 +300,7 @@ function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
   const identityKeyToIdx = new Map<string, number>()
 
   for (const message of [...messages].sort((a, b) => messageTimestamp(a) - messageTimestamp(b))) {
-    const candidateIds = messageIdentityKeys(message)
+    const candidateIds = scopedMessageIdentityKeys(message)
     let matchIndex = -1
     let preferCandidate = false
 
@@ -242,7 +341,7 @@ function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
     }
 
     // Register all identity keys for the merged/inserted message for fast future lookups
-    for (const id of messageIdentityKeys(deduped[insertIdx])) {
+    for (const id of scopedMessageIdentityKeys(deduped[insertIdx])) {
       if (!identityKeyToIdx.has(id)) identityKeyToIdx.set(id, insertIdx)
     }
   }
@@ -250,8 +349,63 @@ function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
   return deduped
 }
 
+function mergeMessagesIntoExisting(
+  state: ChatMessage[],
+  incoming: ChatMessage[],
+): ChatMessage[] {
+  const merged = [...state]
+  const identityKeyToIdx = new Map<string, number>()
+  merged.forEach((message, index) => {
+    for (const key of scopedMessageIdentityKeys(message)) identityKeyToIdx.set(key, index)
+  })
+
+  for (const candidate of [...incoming].sort((a, b) => messageTimestamp(a) - messageTimestamp(b))) {
+    let matchIndex = -1
+    for (const key of scopedMessageIdentityKeys(candidate)) {
+      const index = identityKeyToIdx.get(key)
+      if (index !== undefined) {
+        matchIndex = index
+        break
+      }
+    }
+    if (matchIndex < 0) {
+      for (let index = merged.length - 1; index >= 0; index -= 1) {
+        if (messagesSemanticallyMatch(merged[index], candidate)) {
+          matchIndex = index
+          break
+        }
+      }
+    }
+
+    if (matchIndex < 0) {
+      matchIndex = merged.length
+      merged.push(candidate)
+    } else {
+      const mounted = merged[matchIndex]
+      merged[matchIndex] = mergeDuplicateMessages(
+        mounted,
+        candidate,
+        mounted.id === candidate.id,
+      )
+    }
+
+    for (const key of scopedMessageIdentityKeys(candidate)) identityKeyToIdx.set(key, matchIndex)
+    for (const key of scopedMessageIdentityKeys(merged[matchIndex])) identityKeyToIdx.set(key, matchIndex)
+  }
+
+  return merged.sort((a, b) => (
+    messageTimestamp(a) === messageTimestamp(b)
+      ? a.id.localeCompare(b.id)
+      : messageTimestamp(a) - messageTimestamp(b)
+  ))
+}
+
 export const __chatStoreTestUtils = {
+  advanceReadTimestamp,
   dedupeMessages,
+  latestPersistentMessageTimestamps,
+  mergeMessagesIntoExisting,
+  unreadMessageCounts,
 }
 
 type ChannelAction =
@@ -335,7 +489,7 @@ function messageReducer(state: ChatMessage[], action: MessageAction): ChatMessag
     }
     case 'MERGE': {
       if (action.messages.length === 0) return state
-      return dedupeMessages([...state, ...action.messages])
+      return mergeMessagesIntoExisting(state, action.messages)
     }
     case 'MARK_SENDER_DELETED': return state.map(m =>
       m.sender === action.senderId ? { ...m, senderDeleted: true, senderName: '[已删除的 Agent]' } : m
@@ -372,6 +526,14 @@ export function useChatStore(): ChatStoreState {
   const [messages, dispatchMsg] = useReducer(messageReducer, [])
   const [readTimestamps, setReadTimestamps] = useState<Record<string, number>>({})
   const [scopeProjectId, setScopeProjectId] = useState<string>('default')
+  const readBaselineProjectRef = useRef<string | null>(null)
+
+  const latestPersistentTimestamps = useMemo(
+    () => latestPersistentMessageTimestamps(messages),
+    [messages],
+  )
+  const latestPersistentTimestampsRef = useRef(latestPersistentTimestamps)
+  latestPersistentTimestampsRef.current = latestPersistentTimestamps
 
   const messagesByChannel = useMemo<Record<string, ChatMessage[]>>(() => {
     const buckets: Record<string, ChatMessage[]> = {}
@@ -382,16 +544,10 @@ export function useChatStore(): ChatStoreState {
     return buckets
   }, [messages])
 
-  const unreadCounts = useMemo<Record<string, number>>(() => {
-    const counts: Record<string, number> = {}
-    for (const message of messages) {
-      if (message.sender === 'user') continue
-      const lastRead = readTimestamps[message.channelId] ?? 0
-      if (message.timestamp <= lastRead) continue
-      counts[message.channelId] = (counts[message.channelId] ?? 0) + 1
-    }
-    return counts
-  }, [messages, readTimestamps])
+  const unreadCounts = useMemo(
+    () => unreadMessageCounts(messages, readTimestamps),
+    [messages, readTimestamps],
+  )
 
   const sendMessage = useCallback((opts: {
     channelId: string; sender: string; senderName: string; content: string;
@@ -421,7 +577,9 @@ export function useChatStore(): ChatStoreState {
   }, [unreadCounts])
 
   const markRead = useCallback((channelId: string) => {
-    setReadTimestamps(prev => ({ ...prev, [channelId]: Date.now() }))
+    const latestTimestamp = latestPersistentTimestampsRef.current[channelId] ?? 0
+    if (latestTimestamp <= 0) return
+    setReadTimestamps(prev => advanceReadTimestamp(prev, channelId, latestTimestamp))
   }, [])
 
   const markSenderDeleted = useCallback((agentId: string) => {
@@ -440,12 +598,15 @@ export function useChatStore(): ChatStoreState {
   const clear = useCallback(() => {
     dispatchCh({ type: 'CLEAR' })
     dispatchMsg({ type: 'CLEAR' })
+    readBaselineProjectRef.current = null
     setReadTimestamps({})
   }, [])
 
   const initFromBackend = useCallback((projectId: string, chs: ChatChannel[], msgs: ChatMessage[]) => {
     const nextProjectId = projectId || 'default'
     const projectChanged = nextProjectId !== scopeProjectId
+    const shouldResetReadBaseline = readBaselineProjectRef.current !== nextProjectId
+    readBaselineProjectRef.current = nextProjectId
     setScopeProjectId(nextProjectId)
     dispatchCh({ type: 'SET', channels: chs })
     // Backend `collab_sync` / `collab_sync_push` payloads carry the
@@ -462,14 +623,11 @@ export function useChatStore(): ChatStoreState {
     } else {
       dispatchMsg({ type: 'MERGE', messages: msgs })
     }
-    // Mark all loaded messages as read so they don't show as unread (#17)
-    const latest: Record<string, number> = {}
-    for (const m of msgs) {
-      if (!latest[m.channelId] || m.timestamp > latest[m.channelId]) {
-        latest[m.channelId] = m.timestamp
-      }
+    // Establish one read baseline when entering a project. Repeated full-sync
+    // payloads must not advance it behind the viewport controller's back.
+    if (shouldResetReadBaseline) {
+      setReadTimestamps(latestPersistentMessageTimestamps(msgs))
     }
-    setReadTimestamps(prev => projectChanged ? latest : ({ ...prev, ...latest }))
   }, [scopeProjectId])
 
   const addMessageFromBackend = useCallback((msg: ChatMessage) => {

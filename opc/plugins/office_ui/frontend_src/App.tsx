@@ -18,14 +18,18 @@ import { ExecutionPanel } from './kanban/ExecutionPanel'
 import { ProjectSelector } from './components/ProjectSelector'
 import { OrgTab } from './org/OrgTab'
 import { notifyTaskAssigned } from './lib/taskChatBridge'
-import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask } from './lib/collabSync'
+import { mapCollabSyncPayload, mapBackendMessage, mapBackendChannel, mapBackendSession, mapBackendBoard, mapBackendColumn, mapBackendTask, mergeSessionDetailHasMore } from './lib/collabSync'
 import { normalizeOrgInfoPayload } from './lib/runtimeOrg'
 import { companyRuntimeControlPatchForBoardStatus } from './lib/sessionRuntime'
 import { getExecutionTurnId } from './lib/workItemRuntimeIds'
 import { normalizeSessionCompanyProfile, normalizeSessionExecMode } from './lib/sessionIdentity'
 import { extractSessionRecruitmentByRole, sessionChannelId } from './lib/sessionRecruitment'
+import { resolveCanonicalTurnId, terminalAssistantTurnId } from './lib/turnIdentity'
+import { compileProjectIdPolicy, type ProjectIdPolicy } from './lib/projectIdPolicy'
+import { loadStoredTheme, saveStoredTheme, isThemeName, themeMessageKey, THEMES, type ThemeName } from './lib/theme'
 import { unassignAgent } from './game/map/OfficeStore'
 import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
+import { useI18n } from './i18n'
 
 function readOutdoorOverrideUi(): 'auto' | 'day' | 'night' {
   try {
@@ -65,7 +69,6 @@ const SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS = new Set([
   'member_inbox_updated',
 ])
 
-type ThemeName = 'midnight' | 'neon' | 'paper' | 'retro' | 'terminal' | 'cozy' | 'openopc'
 type AppPage = 'office' | 'workspace' | 'org' | 'mapEditor'
 type AppExecMode = 'task' | 'company' | 'org'
 
@@ -443,6 +446,7 @@ function MaybeExecutionPanel({ taskId, sessions, agents, onClose }: {
 }
 
 export default function App() {
+  const { locale, setLocale, t, translateMaybe } = useI18n()
   const bridgeRef = useRef(new GameBridge())
   useMemo(() => registerTestRunner(bridgeRef.current), [])
   const clientRef = useRef<VisualSocketClient | null>(null)
@@ -457,8 +461,17 @@ export default function App() {
   const [events, setEvents] = useState<VisualEvent[]>([])
   const [uiTick, setUiTick] = useState(0)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
-  const [theme, setTheme] = useState<ThemeName>('openopc')
+  const [projectIdPolicy, setProjectIdPolicy] = useState<ProjectIdPolicy | null>(null)
+  const [theme, setTheme] = useState<ThemeName>(loadStoredTheme)
   const [showSubagents, setShowSubagents] = useState(true)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem('opc_office_sidebar_collapsed') === '1' } catch { return false }
+  })
+  const toggleSidebar = () => setSidebarCollapsed(v => {
+    const next = !v
+    try { localStorage.setItem('opc_office_sidebar_collapsed', next ? '1' : '0') } catch { /* private mode */ }
+    return next
+  })
   const [eventTypeFilter, setEventTypeFilter] = useState('all')
   const [activePage, setActivePage] = useState<AppPage>('workspace')
   const [swarmAgents, setSwarmAgents] = useState<AgentInfo[]>([])
@@ -468,7 +481,6 @@ export default function App() {
   const [globalCompanyProfile, setGlobalCompanyProfile] = useState<'corporate' | 'custom'>('corporate')
   const [globalTaskPreferredAgent, setGlobalTaskPreferredAgent] = useState<TaskPreferredAgent>('native')
   const [orgInfoData, setOrgInfoData] = useState<OrgInfoPayload | null>(null)
-  const [recoveryStatus, setRecoveryStatus] = useState<any>(null)
   const [commsState, setCommsState] = useState<import('./lib/wsClient').CommsStatePayload | null>(null)
   const [commsMessage, setCommsMessage] = useState<import('./lib/wsClient').CommsMessagePayload | null>(null)
   const [talentTemplates, setTalentTemplates] = useState<TalentTemplate[]>([])
@@ -613,18 +625,36 @@ export default function App() {
       if (generation !== projectViewGenerationRef.current) return
       // Re-check liveness at fire time (ref may have been updated by now)
       if (!force && !shouldRefreshLiveSession(taskId, sessionStoreRef.current)) return
+      const client = clientRef.current
       sessionStoreRef.current?.updateSession(taskId, {
         detailLoading: true,
         detailError: undefined,
         viewGeneration: generation,
       })
-      clientRef.current?.sessionDetail(scopedProjectId, taskId, {
+      if (!client) {
+        sessionStoreRef.current?.updateSession(taskId, {
+          detailLoading: false,
+          detailError: 'connection_unavailable',
+        })
+        return
+      }
+      void client.sessionDetail(scopedProjectId, taskId, {
         limit: 200,
         detailLevel,
         include: detailLevel === 'full'
           ? ['messages', 'session_state', 'progress', 'work_items', 'runtime_context']
           : ['messages', 'session_state'],
         viewGeneration: generation,
+      }).then((payload) => {
+        // Transport-local failures resolve the request Promise without
+        // producing a websocket ACK.
+        if (payload.ok !== false) return
+        if (scopedProjectId !== getActiveProjectId()) return
+        if (generation !== projectViewGenerationRef.current) return
+        sessionStoreRef.current?.updateSession(taskId, {
+          detailLoading: false,
+          detailError: String(payload.error ?? 'request_failed'),
+        })
       })
     }, 180)
     pendingSessionDetailRefreshRef.current.set(timerKey, tid)
@@ -741,6 +771,65 @@ export default function App() {
     return () => { bridge.off('agentSelected', handler) }
   }, [])
 
+  // ── Runtime-delta coalescing ────────────────────────────────────────
+  // assistant_delta / thinking_delta arrive at token frequency; writing each
+  // one straight into the stores re-renders the whole app once per token.
+  // Buffer them per task and flush at most every 80ms. Any non-delta event
+  // for the same task flushes first, so store-write ordering (e.g. clearDraft
+  // on turn boundaries) is preserved exactly.
+  const pendingDeltaFlushRef = useRef<Map<string, {
+    draftText: string
+    draftIteration?: number
+    draftTurnId?: string
+    sessionPatch: Partial<import('./types/kanban').Session>
+    kanbanPatch: Partial<KanbanTask>
+  }>>(new Map())
+  const deltaFlushTimerRef = useRef<number | null>(null)
+
+  const flushPendingDeltas = useCallback((onlyTaskId?: string) => {
+    const pending = pendingDeltaFlushRef.current
+    if (pending.size === 0) return
+    const ids = onlyTaskId ? [onlyTaskId] : Array.from(pending.keys())
+    for (const taskId of ids) {
+      const entry = pending.get(taskId)
+      if (!entry) continue
+      pending.delete(taskId)
+      const ss = sessionStoreRef.current
+      if (entry.draftText) {
+        ss?.appendDraft(taskId, entry.draftText, entry.draftIteration, entry.draftTurnId)
+      }
+      ss?.updateSession(taskId, entry.sessionPatch)
+      if (Object.keys(entry.kanbanPatch).length > 0) {
+        boardStoreRef.current?.updateTask(taskId, entry.kanbanPatch)
+      }
+    }
+    if (pending.size === 0 && deltaFlushTimerRef.current !== null) {
+      window.clearTimeout(deltaFlushTimerRef.current)
+      deltaFlushTimerRef.current = null
+    }
+  }, [])
+
+  const scheduleDeltaFlush = useCallback(() => {
+    if (deltaFlushTimerRef.current !== null) return
+    deltaFlushTimerRef.current = window.setTimeout(() => {
+      deltaFlushTimerRef.current = null
+      flushPendingDeltas()
+    }, 80)
+  }, [flushPendingDeltas])
+
+  // uiTick only feeds the office-page visual memos (cards/offices/seats).
+  // A trailing 300ms throttle caps their refresh cost regardless of the
+  // websocket event rate; the office view is cosmetic, so ≤300ms staleness
+  // is invisible.
+  const uiTickTimerRef = useRef<number | null>(null)
+  const bumpUiTickThrottled = useCallback(() => {
+    if (uiTickTimerRef.current !== null) return
+    uiTickTimerRef.current = window.setTimeout(() => {
+      uiTickTimerRef.current = null
+      setUiTick(n => n + 1)
+    }, 300)
+  }, [])
+
   useEffect(() => {
     const client = new VisualSocketClient(wsUrl, {
       onSnapshot: (data) => {
@@ -834,6 +923,13 @@ export default function App() {
             const data = evt.data as Record<string, unknown>
             const taskId = typeof data.task_id === 'string' ? data.task_id : ''
             if (taskId) {
+              const isDeltaEvent = evt.type === 'assistant_delta' || evt.type === 'thinking_delta'
+              const bufferedDraftTurnId = pendingDeltaFlushRef.current.get(taskId)?.draftTurnId
+              // Store-write ordering guarantee: everything buffered for this
+              // task lands before a non-delta event. A matching terminal
+              // message replaces the draft later; flushing here must not make
+              // a completion boundary remove the visible turn prematurely.
+              if (!isDeltaEvent) flushPendingDeltas(taskId)
               const ss = sessionStoreRef.current
               const bs = boardStoreRef.current
               const existingSession = ss?.sessions.find(session => session.taskId === taskId)
@@ -842,14 +938,13 @@ export default function App() {
                 : ''
               const executionMode = typeof data.execution_mode === 'string' ? data.execution_mode : ''
               const isTaskModeRuntime = executionMode === 'task_mode' || projectionId === 'task_mode_execution'
-              const turnId = typeof data.turn_id === 'string' && data.turn_id
-                ? data.turn_id
-                : typeof data.canonical_turn_id === 'string' && data.canonical_turn_id
-                  ? data.canonical_turn_id
-                  : typeof data.execution_turn_id === 'string' && data.execution_turn_id
-                    ? data.execution_turn_id
-                    : undefined
-              if (projectionId && projectionId !== 'task_mode_execution' && !isTaskModeRuntime) {
+              // Drafts represent one logical assistant turn. The shared
+              // resolver deliberately prefers conversation identity over the
+              // iteration-scoped runtime turn id.
+              const turnId = resolveCanonicalTurnId(data) || undefined
+              const marksCompanyRuntime =
+                !!projectionId && projectionId !== 'task_mode_execution' && !isTaskModeRuntime
+              if (marksCompanyRuntime && !isDeltaEvent && existingSession?.isCompanyRuntime !== true) {
                 ss?.setCompanyRuntime(taskId, true)
               }
 
@@ -858,29 +953,63 @@ export default function App() {
                 ...(evt.type === 'member_inbox_updated' ? {} : { updatedAt: Date.now() }),
                 ...sessionRuntimePatchFromPayload(data),
               }
-              if (evt.type === 'turn_started') {
-                ss?.clearDraft(taskId)
-              } else if (evt.type === 'turn_completed' || evt.type === 'turn_failed' || evt.type === 'checkpoint_saved') {
-                ss?.clearDraft(taskId)
-              } else if (evt.type === 'assistant_delta' && typeof data.text === 'string' && data.text) {
-                ss?.appendDraft(
-                  taskId,
-                  data.text,
-                  typeof data.iteration === 'number'
-                    ? data.iteration
-                    : existingSession?.draftIteration,
-                  turnId,
-                )
-              }
-              ss?.updateSession(taskId, runtimePartial)
               const toolName = typeof data.tool_name === 'string' ? data.tool_name : undefined
-              bs?.updateTask(taskId, {
+              const kanbanPatch: Partial<KanbanTask> = {
                 ...kanbanRuntimePatchFromPayload(data),
                 // currentTool is active-only (clears between tools); displayTool
                 // is sticky and only updates on a real, non-empty tool name.
                 ...(toolName !== undefined ? { currentTool: toolName || undefined } : {}),
                 ...(toolName ? { displayTool: toolName } : {}),
-              })
+              }
+              if (isDeltaEvent) {
+                const pending = pendingDeltaFlushRef.current
+                let entry = pending.get(taskId)
+                const deltaText = evt.type === 'assistant_delta' && typeof data.text === 'string'
+                  ? data.text
+                  : ''
+                // A turn boundary inside the buffer would corrupt the draft
+                // reset logic (APPEND_DRAFT resets on turnId change) — flush
+                // the previous turn's chunk before starting a new one.
+                if (
+                  entry && deltaText && entry.draftText &&
+                  entry.draftTurnId !== undefined && turnId !== undefined &&
+                  entry.draftTurnId !== turnId
+                ) {
+                  flushPendingDeltas(taskId)
+                  entry = undefined
+                }
+                if (!entry) {
+                  entry = { draftText: '', sessionPatch: {}, kanbanPatch: {} }
+                  pending.set(taskId, entry)
+                }
+                if (deltaText) {
+                  entry.draftText += deltaText
+                  entry.draftIteration = typeof data.iteration === 'number'
+                    ? data.iteration
+                    : entry.draftIteration ?? existingSession?.draftIteration
+                  if (turnId !== undefined) entry.draftTurnId = turnId
+                }
+                entry.sessionPatch = {
+                  ...entry.sessionPatch,
+                  ...runtimePartial,
+                  ...(marksCompanyRuntime ? { isCompanyRuntime: true } : {}),
+                }
+                entry.kanbanPatch = { ...entry.kanbanPatch, ...kanbanPatch }
+                scheduleDeltaFlush()
+              } else {
+                const activeDraftTurnId = String(
+                  bufferedDraftTurnId ?? existingSession?.draftTurnId ?? '',
+                ).trim()
+                const startsNewCanonicalTurn = evt.type === 'turn_started'
+                  && !!turnId
+                  && !!activeDraftTurnId
+                  && turnId !== activeDraftTurnId
+                if (evt.type === 'turn_failed' || startsNewCanonicalTurn) {
+                  ss?.clearDraft(taskId)
+                }
+                ss?.updateSession(taskId, runtimePartial)
+                bs?.updateTask(taskId, kanbanPatch)
+              }
               const skipDetailRefresh = (
                 isTaskModeRuntime && TASK_MODE_LOW_VALUE_RUNTIME_EVENTS.has(evt.type)
               ) || SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS.has(evt.type)
@@ -900,7 +1029,7 @@ export default function App() {
             }
           }
 
-          setUiTick((n) => n + 1)
+          bumpUiTickThrottled()
         } catch (e) { console.error('[onEvent] Error:', e, evt) }
       },
       onAck: (payload) => {
@@ -949,6 +1078,7 @@ export default function App() {
             const totalMessageCount = typeof payload.message_count === 'number'
               ? payload.message_count
               : detailMessages.length
+            const detailLevel = payload.detail_level === 'full' ? 'full' : 'summary'
             const cs = chatStoreRef.current
             if (cs && detailMessages.length > 0) {
               cs.mergeMessagesFromBackend(detailMessages)
@@ -956,15 +1086,18 @@ export default function App() {
             const ss = sessionStoreRef.current
             if (ss && detailTaskId) {
               const existingSession = ss.sessions.find(session => session.taskId === detailTaskId)
+              const previousHasMore = detailLevel === 'full'
+                ? existingSession?.fullHasMore
+                : existingSession?.summaryHasMore
+              const detailHasMore = mergeSessionDetailHasMore(
+                previousHasMore,
+                payload.has_more === true,
+                payload.client_history_page === true,
+              )
               const draftTurnId = String(existingSession?.draftTurnId ?? '').trim()
-              const detailHasFinalForDraft = !!draftTurnId && detailMessages.some((message) => {
-                if (message.sender === 'user') return false
-                const metadata = message.metadata ?? {}
-                const transcriptKind = String(metadata.transcript_kind ?? metadata.kind ?? '').trim()
-                if (transcriptKind !== 'runtime_v2_assistant') return false
-                const messageTurnId = String(metadata.canonical_turn_id ?? metadata.turn_id ?? '').trim()
-                return messageTurnId === draftTurnId
-              })
+              const detailHasFinalForDraft = !!draftTurnId
+                && !!cs
+                && detailMessages.some(message => terminalAssistantTurnId(message) === draftTurnId)
               if (detailHasFinalForDraft) {
                 ss.clearDraft(detailTaskId)
               }
@@ -978,8 +1111,11 @@ export default function App() {
                 ...(typeof payload.handoff_to === 'string' ? { handoffTo: payload.handoff_to } : {}),
                 messageCount: totalMessageCount,
                 detailLoaded: true,
-                fullLoaded: payload.detail_level === 'full' && payload.has_more !== true,
-                hasMore: payload.has_more === true,
+                ...(detailLevel === 'full' ? { fullLoaded: !detailHasMore } : {}),
+                hasMore: detailHasMore,
+                ...(detailLevel === 'full'
+                  ? { fullHasMore: detailHasMore }
+                  : { summaryHasMore: detailHasMore }),
                 detailLoading: false,
                 detailError: undefined,
                 viewGeneration: detailGeneration ?? projectViewGenerationRef.current,
@@ -1008,6 +1144,7 @@ export default function App() {
           }
           // Handle project list response
           if (payload.ok && Array.isArray(payload.projects)) {
+            setProjectIdPolicy(compileProjectIdPolicy(payload.project_id_policy))
             const ps = projectStoreRef.current
             if (ps) {
               const previousActiveId = getActiveProjectId()
@@ -1079,6 +1216,7 @@ export default function App() {
       onStatus: (next, detail) => {
         setStatus(next)
         setStatusDetail(detail ?? '')
+        if (next !== 'connected') setProjectIdPolicy(null)
         if (next === 'connected') {
           const projectId = getActiveProjectId()
           client.listProjects()
@@ -1108,7 +1246,6 @@ export default function App() {
                 runtimeControlState: String(payload.runtime_control_state ?? payload.runtimeControlState ?? 'idle') as any,
                 canStop: Boolean(payload.can_stop ?? payload.canStop),
                 canResume: Boolean(payload.can_resume ?? payload.canResume),
-                resumeParentTaskId: String(payload.resume_parent_task_id ?? payload.resumeParentTaskId ?? ''),
                 resumeParentSessionId: String(payload.resume_parent_session_id ?? payload.resumeParentSessionId ?? ''),
                 pendingRuntimeCheckpointId: String(payload.pending_runtime_checkpoint_id ?? payload.pendingRuntimeCheckpointId ?? ''),
                 stopIntentId: String(payload.stop_intent_id ?? payload.stopIntentId ?? ''),
@@ -1316,6 +1453,56 @@ export default function App() {
             })
           }
           scheduleSessionDetailRefresh(payload.task_id)
+        }
+      },
+      onRuntimeStatusSync: (payload) => {
+        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
+        const ss = sessionStoreRef.current
+        const bs = boardStoreRef.current
+        if (!ss) return
+        // Periodic reconciliation against the backend's authoritative status.
+        // Diff before dispatching: a tick where nothing drifted must not
+        // trigger a single store update (and therefore no re-render).
+        for (const entry of payload.sessions ?? []) {
+          const taskId = String(entry.task_id ?? '').trim()
+          if (!taskId) continue
+          const session = ss.sessions.find((s) => s.taskId === taskId)
+          if (!session) continue
+          const status = String(entry.status ?? '').trim()
+          const patch: Partial<import('./types/kanban').Session> = {}
+          if (status && status !== session.status) patch.status = status
+          const rawAgentStatus = typeof entry.agent_status === 'string' ? entry.agent_status.trim() : ''
+          if (rawAgentStatus === 'idle' || rawAgentStatus === 'reflecting' || rawAgentStatus === 'tool_active') {
+            if (rawAgentStatus !== session.agentStatus) patch.agentStatus = rawAgentStatus
+            const tool = typeof entry.current_tool === 'string' && entry.current_tool.trim()
+              ? entry.current_tool
+              : undefined
+            if (tool !== session.currentTool) patch.currentTool = tool
+            if (runtimeStatusClearsDisplayTool(rawAgentStatus) && session.displayTool !== undefined) {
+              patch.displayTool = undefined
+            }
+          } else {
+            // No live tracker for this task: only clear stale indicators when
+            // the backend says the task is no longer running (mirrors the
+            // mergeLiveRuntimeField semantics used by collab_sync).
+            const controlActive = session.runtimeControlState === 'running'
+              || session.runtimeControlState === 'suspending'
+              || session.runtimeControlState === 'resuming'
+            if (status && status !== 'running' && !controlActive) {
+              if (session.agentStatus !== undefined) patch.agentStatus = undefined
+              if (session.currentTool !== undefined) patch.currentTool = undefined
+              if (session.displayTool !== undefined) patch.displayTool = undefined
+            }
+          }
+          if (Object.keys(patch).length === 0) continue
+          ss.updateSession(taskId, patch)
+          if (bs && ('agentStatus' in patch || 'currentTool' in patch || 'displayTool' in patch)) {
+            const boardPatch: Partial<KanbanTask> = {}
+            if ('agentStatus' in patch) boardPatch.agentStatus = patch.agentStatus as KanbanTask['agentStatus']
+            if ('currentTool' in patch) boardPatch.currentTool = patch.currentTool
+            if ('displayTool' in patch) boardPatch.displayTool = patch.displayTool
+            bs.updateTask(taskId, boardPatch)
+          }
         }
       },
       onWorkerNotification: (payload) => {
@@ -1543,8 +1730,14 @@ export default function App() {
           console.debug('[onSessionMessage]', mapped.sender, mapped.channelId, mapped.content?.slice(0, 60))
           cs.addMessageFromBackend(mapped)
           const taskId = mapped.channelId.startsWith('session:') ? mapped.channelId.slice('session:'.length) : ''
+          const terminalTurnId = terminalAssistantTurnId(mapped)
+          const activeDraftTurnId = String(
+            sessionStoreRef.current?.sessions.find(session => session.taskId === taskId)?.draftTurnId ?? '',
+          ).trim()
           if (taskId && mapped.sender !== 'user') {
-            sessionStoreRef.current?.clearDraft(taskId)
+            if (terminalTurnId && terminalTurnId === activeDraftTurnId) {
+              sessionStoreRef.current?.clearDraft(taskId)
+            }
             // Force refresh — session messages are critical content that must sync
             scheduleSessionDetailRefresh(taskId, 'full', true)
           }
@@ -1618,10 +1811,6 @@ export default function App() {
           clientRef.current?.collabSync(getActiveProjectId(), undefined, projectViewGenerationRef.current)
         }
       },
-      onRecoveryStatus: (payload) => {
-        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
-        setRecoveryStatus(payload)
-      },
       onCommsState: (payload) => {
         if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
         setCommsState(payload)
@@ -1629,13 +1818,6 @@ export default function App() {
       onCommsMessage: (payload) => {
         if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, true)) return
         setCommsMessage(payload)
-      },
-      onRecoveryResult: (payload) => {
-        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
-        if (payload?.status === 'completed' || payload?.status === 'cancelled') {
-          // Trigger a re-scan
-          clientRef.current?.recoveryAction(getActiveProjectId(), 'scan')
-        }
       },
       onTalentList: (payload) => {
         setTalentTemplates(payload.templates ?? [])
@@ -1830,6 +2012,15 @@ export default function App() {
       timersRef.current.clear()
       for (const tid of pendingSessionDetailRefreshRef.current.values()) clearTimeout(tid)
       pendingSessionDetailRefreshRef.current.clear()
+      if (deltaFlushTimerRef.current !== null) {
+        window.clearTimeout(deltaFlushTimerRef.current)
+        deltaFlushTimerRef.current = null
+      }
+      pendingDeltaFlushRef.current.clear()
+      if (uiTickTimerRef.current !== null) {
+        window.clearTimeout(uiTickTimerRef.current)
+        uiTickTimerRef.current = null
+      }
     }
   }, [wsUrl])
 
@@ -2102,18 +2293,13 @@ export default function App() {
   ) => {
     const session = sessionStore.sessions.find(s => s.taskId === taskId)
     const parentSessionId = session?.resumeParentSessionId ?? session?.parentSessionId ?? session?.sessionId
-    const parentTaskId = session?.resumeParentTaskId
-      ?? (parentSessionId ? sessionStore.sessions.find(s => s.sessionId === parentSessionId && !s.parentSessionId)?.taskId : undefined)
-      ?? taskId
     for (const candidate of sessionStore.sessions) {
       if (
         candidate.taskId === taskId
-        || candidate.taskId === parentTaskId
         || (!!parentSessionId && (candidate.parentSessionId === parentSessionId || candidate.sessionId === parentSessionId))
       ) {
         sessionStore.updateSession(candidate.taskId, {
           ...patch,
-          resumeParentTaskId: parentTaskId,
           resumeParentSessionId: parentSessionId,
         })
       }
@@ -2138,7 +2324,7 @@ export default function App() {
     clientRef.current?.sessionStop(getActiveProjectId(), taskId)
   }, [sessionStore.sessions, markRuntimeControlForTask, getActiveProjectId])
 
-  const handleSessionResume = useCallback((taskId: string) => {
+  const handleSessionResume = useCallback((taskId: string, runtimeSessionId?: string, checkpointId?: string) => {
     const session = sessionStore.sessions.find(s => s.taskId === taskId)
     const isCompanyRuntime = session?.execMode === 'company'
       || session?.execMode === 'org'
@@ -2153,7 +2339,12 @@ export default function App() {
         canResume: false,
       })
     }
-    clientRef.current?.sessionResume(getActiveProjectId(), taskId)
+    clientRef.current?.sessionResume(
+      getActiveProjectId(),
+      taskId,
+      runtimeSessionId ?? session?.resumeParentSessionId ?? session?.parentSessionId ?? session?.sessionId,
+      checkpointId ?? session?.pendingRuntimeCheckpointId,
+    )
   }, [sessionStore.sessions, markRuntimeControlForTask, getActiveProjectId])
 
   const handleGlobalModeChange = useCallback((mode: 'task' | 'company' | 'org' | 'custom', profile?: string, orgId?: string) => {
@@ -2185,7 +2376,7 @@ export default function App() {
 
 
   return (
-    <div className={`app-shell theme-${theme}`}>
+    <div className="app-shell" data-theme={theme}>
       {orgToast && (
         <div className={`org-toast org-toast--${orgToast.kind}`} role="status" aria-live="polite">
           {orgToast.text}
@@ -2199,6 +2390,7 @@ export default function App() {
           <ProjectSelector
             projects={projectStore.projects}
             activeId={projectStore.activeProjectId}
+            projectIdPolicy={status === 'connected' ? projectIdPolicy : null}
             onSelect={(id) => {
               const switchSeq = beginProjectSwitch(id)
               clientRef.current?.switchProject(id, switchSeq)
@@ -2212,26 +2404,47 @@ export default function App() {
         <div className="topbar-center">
           <div className="page-nav">
             <button className={`page-nav-btn${activePage === 'workspace' ? ' active' : ''}`} onClick={() => setActivePage('workspace')}>
-              Workspace
+              {t('app.page.workspace')}
               {(() => {
                 const total = chatStore.channels.reduce((sum, ch) => sum + chatStore.getUnreadCount(ch.id), 0)
                 return total > 0 ? <span className="nav-unread-badge">{total > 99 ? '99+' : total}</span> : null
               })()}
             </button>
-            <button className={`page-nav-btn${activePage === 'office' ? ' active' : ''}`} onClick={() => setActivePage('office')}>Office</button>
-            <button className={`page-nav-btn${activePage === 'org' ? ' active' : ''}`} onClick={() => setActivePage('org')}>Org</button>
+            <button className={`page-nav-btn${activePage === 'office' ? ' active' : ''}`} onClick={() => setActivePage('office')}>{t('app.page.office')}</button>
+            <button className={`page-nav-btn${activePage === 'org' ? ' active' : ''}`} onClick={() => setActivePage('org')}>{t('app.page.org')}</button>
           </div>
           <div className="stat-chips">
-            <span className="stat-chip"><b>{metrics.totalAgents}</b> agents</span>
-            <span className="stat-chip"><b>{metrics.totalSkills}</b> skills</span>
-            <span className="stat-chip"><b>{boardStore.getOpenTaskCount()}</b> tasks</span>
+            <span className="stat-chip"><b>{metrics.totalAgents}</b> {t('app.metric.agents')}</span>
+            <span className="stat-chip"><b>{metrics.totalSkills}</b> {t('app.metric.skills')}</span>
+            <span className="stat-chip"><b>{boardStore.getOpenTaskCount()}</b> {t('app.metric.tasks')}</span>
           </div>
         </div>
         <div className="topbar-right">
+          <div className="language-toggle" role="group" aria-label={t('language.label')} title={t('language.label')}>
+            <button
+              type="button"
+              data-locale="en"
+              aria-pressed={locale === 'en'}
+              className={`language-toggle-btn${locale === 'en' ? ' active' : ''}`}
+              onClick={() => setLocale('en')}
+            >
+              {t('language.english')}
+            </button>
+            <button
+              type="button"
+              data-locale="zh-CN"
+              aria-pressed={locale === 'zh-CN'}
+              className={`language-toggle-btn${locale === 'zh-CN' ? ' active' : ''}`}
+              onClick={() => setLocale('zh-CN')}
+            >
+              {t('language.chinese')}
+            </button>
+          </div>
           <select
             className="theme-select"
             value={outdoorOverride}
-            title="Outdoor lighting override"
+            title={t('outdoor.title')}
+            aria-label={t('outdoor.title')}
             onChange={(e) => {
               const v = e.target.value as 'auto' | 'day' | 'night'
               setOutdoorOverride(v)
@@ -2249,20 +2462,27 @@ export default function App() {
               bridgeRef.current.syncOutdoorLighting()
             }}
           >
-            <option value="auto">Outdoor auto</option>
-            <option value="day">Outdoor day</option>
-            <option value="night">Outdoor night</option>
+            <option value="auto">{t('outdoor.auto')}</option>
+            <option value="day">{t('outdoor.day')}</option>
+            <option value="night">{t('outdoor.night')}</option>
           </select>
-          <select className="theme-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemeName)}>
-            <option value="midnight">Midnight</option>
-            <option value="neon">Neon</option>
-            <option value="paper">Paper</option>
-            <option value="retro">Retro</option>
-            <option value="terminal">Terminal</option>
-            <option value="cozy">Cozy</option>
-            <option value="openopc">OpenOPC</option>
+          <select
+            className="theme-select"
+            value={theme}
+            title={t('theme.label')}
+            aria-label={t('theme.label')}
+            onChange={(e) => {
+              const next = e.currentTarget.value
+              if (!isThemeName(next)) return
+              setTheme(next)
+              saveStoredTheme(next)
+            }}
+          >
+            {THEMES.map(({ name }) => (
+              <option key={name} value={name}>{t(themeMessageKey(name))}</option>
+            ))}
           </select>
-          <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title="Developer Tools">
+          <button className={`icon-btn ${showDevTools ? 'active' : ''}`} onClick={() => setShowDevTools((v) => !v)} title={t('dev.tools')} aria-label={t('dev.tools')}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5.5 2L2 5.5 5.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.5 7L14 10.5 10.5 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </button>
         </div>
@@ -2286,9 +2506,6 @@ export default function App() {
           activeSavedOrg={activeSavedOrg}
           onSavedOrgsList={handleSavedOrgsList}
           onSavedOrgLoad={handleSavedOrgLoad}
-          recoveryStatus={recoveryStatus}
-          onRecoveryResume={(id) => clientRef.current?.recoveryAction(getActiveProjectId(), 'resume', id)}
-          onRecoveryCancel={(id) => clientRef.current?.recoveryAction(getActiveProjectId(), 'cancel', id)}
           commsState={commsState}
           commsMessage={commsMessage}
           onCommsRefresh={(opts) => {
@@ -2328,17 +2545,25 @@ export default function App() {
           onSessionStop={handleSessionStop}
           onSessionResume={handleSessionResume}
           onSessionComplete={(taskId) => clientRef.current?.sessionComplete(getActiveProjectId(), taskId)}
-          onLoadSessionDetail={(taskId, opts) => clientRef.current?.sessionDetail(
-            getActiveProjectId(),
-            taskId,
-            {
-              ...opts,
-              include: opts?.detailLevel === 'full'
-                ? ['messages', 'session_state', 'progress', 'work_items', 'runtime_context']
-                : ['messages', 'session_state'],
-              viewGeneration: projectViewGenerationRef.current,
-            },
-          )}
+          onLoadSessionDetail={(taskId, opts) => {
+            const client = clientRef.current
+            if (!client) return
+            return client.sessionDetail(
+              getActiveProjectId(),
+              taskId,
+              {
+                ...opts,
+                include: opts?.detailLevel === 'full'
+                  ? ['messages', 'session_state', 'progress', 'work_items', 'runtime_context']
+                  : ['messages', 'session_state'],
+                viewGeneration: projectViewGenerationRef.current,
+              },
+            ).then((payload) => {
+              if (payload.ok === false) {
+                throw new Error(String(payload.error ?? 'session_detail failed'))
+              }
+            })
+          }}
           onOpenExecutionPanel={(taskId) => setExecutionPanelTaskId(taskId)}
           onCollabSync={() => clientRef.current?.collabSync(getActiveProjectId(), undefined, projectViewGenerationRef.current)}
         />
@@ -2408,12 +2633,20 @@ export default function App() {
       )}
 
       {/* Main Grid */}
-      <main className={`main-grid${activePage !== 'office' ? ' hidden' : ''}`}>
+      <main className={`main-grid${activePage !== 'office' ? ' hidden' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
         {/* Phaser Game Canvas */}
         <section className="canvas-wrap">
-          <PhaserGame bridge={bridgeRef.current} />
-          <button className="canvas-float-btn" onClick={() => setShowSubagents((v) => !v)} title={showSubagents ? 'Hide sub-agents' : 'Show sub-agents'}>
+          <PhaserGame bridge={bridgeRef.current} active={activePage === 'office'} />
+          <button className="canvas-float-btn" onClick={() => setShowSubagents((v) => !v)} title={showSubagents ? t('office.hideSubagents') : t('office.showSubagents')}>
             {showSubagents ? '👥' : '👤'}
+          </button>
+          <button
+            className="sidebar-collapse-btn"
+            onClick={toggleSidebar}
+            title={sidebarCollapsed ? t('office.showSidePanel') : t('office.hideSidePanel')}
+            aria-label={sidebarCollapsed ? t('office.showSidePanel') : t('office.hideSidePanel')}
+          >
+            <span className="collapse-glyph">{sidebarCollapsed ? '❮' : '❯'}</span>
           </button>
         </section>
 
@@ -2426,13 +2659,13 @@ export default function App() {
                 <div className="mode-info-bar">
                   <span className="mode-badge">{globalExecMode === 'company' ? `${globalExecMode}/${globalCompanyProfile}` : globalModeLabel}</span>
                   {isOrgMode ? (
-                    <span className="mode-hint">Manage your team in the <b>Org</b> tab</span>
+                    <span className="mode-hint">{t('office.modeHint.org')}</span>
                   ) : (
-                    <span className="mode-hint">Switch to <b>Org</b> mode to create or manage agents</span>
+                    <span className="mode-hint">{t('office.modeHint.switch')}</span>
                   )}
                 </div>
 
-                <div className="section-label">Offices <span className="count-badge">{offices.length}</span></div>
+                <div className="section-label">{t('office.offices')} <span className="count-badge">{offices.length}</span></div>
                 <div className="office-cards">
                   {offices.map((office) => {
                     const deskCount = getOfficeDeskSeats(office.id).length
@@ -2454,14 +2687,14 @@ export default function App() {
                           ) : (
                             <>
                               <span className="office-name">{office.name}</span>
-                              <button className="office-edit-btn" title="Rename" onClick={(e) => { e.stopPropagation(); setEditingOfficeName(office.id); setOfficeNameDraft(office.name) }}>✎</button>
+                              <button className="office-edit-btn" title={t('office.rename')} onClick={(e) => { e.stopPropagation(); setEditingOfficeName(office.id); setOfficeNameDraft(office.name) }}>✎</button>
                             </>
                           )}
                           <span className="office-capacity">{assignedCards.length}/{deskCount}</span>
                         </div>
                         <div className="office-agents">
                           {assignedCards.map(c => (
-                            <span key={c.id} className="office-agent-chip" title={`${c.displayName} — ${c.seatId ?? 'no seat'}`} onClick={(e) => { e.stopPropagation(); selectAgent(c.id) }}>
+                            <span key={c.id} className="office-agent-chip" title={`${c.displayName} — ${c.seatId ?? t('office.noSeat')}`} onClick={(e) => { e.stopPropagation(); selectAgent(c.id) }}>
                               {c.displayName.slice(0, 8)}
                             </span>
                           ))}
@@ -2472,7 +2705,7 @@ export default function App() {
                               onClick={e => e.stopPropagation()}
                               onChange={e => { if (e.target.value) handleAssignAgent(office.id, e.target.value) }}
                             >
-                              <option value="">+ Move here</option>
+                              <option value="">{t('office.moveHere')}</option>
                               {otherAgents.map(a => (
                                 <option key={a.id} value={a.id}>{a.displayName} ({offices.find(o => o.id === (cards.find(cc => cc.id === a.id)?.officeId))?.name ?? '?'})</option>
                               ))}
@@ -2484,7 +2717,7 @@ export default function App() {
                   })}
                 </div>
 
-                <div className="section-label">Active Agents <span className="count-badge">{swarmAgents.length}</span></div>
+                <div className="section-label">{t('office.activeAgents')} <span className="count-badge">{swarmAgents.length}</span></div>
                 <div className="agent-list">
                   {swarmAgents.map((agent) => (
                     <div key={agent.agent_id} className={`agent-row ${selectedAgentId === agent.agent_id ? 'selected' : ''}`}>
@@ -2492,7 +2725,7 @@ export default function App() {
                         <span className={`dot ${agent.status}`} />
                         <div className="agent-info">
                           <span className="agent-name">{agent.name}</span>
-                          <span className="agent-spec">{agent.specialties.slice(0, 2).join(' · ') || 'general'}</span>
+                          <span className="agent-spec">{agent.specialties.slice(0, 2).join(' · ') || t('common.general')}</span>
                         </div>
                       </button>
                       {isOrgMode && (
@@ -2500,27 +2733,27 @@ export default function App() {
                           ? <span className="agent-del" style={{ pointerEvents: 'none' }}><span className="spinner-inline" /></span>
                           : confirmDeleteId === agent.agent_id
                             ? <span className="del-confirm">
-                                <span className="del-confirm-label">Delete?</span>
-                                <button className="del-confirm-yes" onClick={() => { setDeletingAgentId(agent.agent_id); setConfirmDeleteId(null); clientRef.current?.deleteAgent(agent.agent_id) }}>Yes</button>
-                                <button className="del-confirm-no" onClick={() => setConfirmDeleteId(null)}>No</button>
+                                <span className="del-confirm-label">{t('office.deleteQuestion')}</span>
+                                <button className="del-confirm-yes" onClick={() => { setDeletingAgentId(agent.agent_id); setConfirmDeleteId(null); clientRef.current?.deleteAgent(agent.agent_id) }}>{t('common.yes')}</button>
+                                <button className="del-confirm-no" onClick={() => setConfirmDeleteId(null)}>{t('common.no')}</button>
                               </span>
-                            : <button className="agent-del" title={`Remove ${agent.name}`} onClick={() => setConfirmDeleteId(agent.agent_id)}>×</button>
+                            : <button className="agent-del" title={t('office.removeAgent', { name: agent.name })} onClick={() => setConfirmDeleteId(agent.agent_id)}>×</button>
                       )}
                     </div>
                   ))}
                   {swarmAgents.length === 0 && (
-                    <div className="empty-state">No agents yet — click a template above to spawn one.</div>
+                    <div className="empty-state">{t('office.emptyAgents')}</div>
                   )}
                 </div>
 
                 {selectedCard && (
-                  <div className="agent-detail">
-                    <div className="agent-detail-name">{selectedCard.displayName}</div>
-                    <div className="agent-detail-row"><span className="detail-label">State</span><span className="detail-value">{selectedCard.state}</span></div>
-                    <div className="agent-detail-row"><span className="detail-label">Tool</span><span className="detail-value">{selectedCard.currentTool ?? '—'}</span></div>
-                    <div className="agent-detail-row"><span className="detail-label">Task</span><span className="detail-value">{selectedCard.taskSummary ?? '—'}</span></div>
+                    <div className="agent-detail">
+                      <div className="agent-detail-name">{selectedCard.displayName}</div>
+                    <div className="agent-detail-row"><span className="detail-label">{t('common.state')}</span><span className="detail-value">{translateMaybe('agent.status', selectedCard.state) || selectedCard.state}</span></div>
+                    <div className="agent-detail-row"><span className="detail-label">{t('common.tool')}</span><span className="detail-value">{selectedCard.currentTool ?? '—'}</span></div>
+                    <div className="agent-detail-row"><span className="detail-label">{t('common.task')}</span><span className="detail-value">{selectedCard.taskSummary ?? '—'}</span></div>
                     <div className="agent-detail-row">
-                      <span className="detail-label">Office</span>
+                      <span className="detail-label">{t('app.page.office')}</span>
                       <select
                         className="detail-select"
                         value={selectedCard.officeId}
@@ -2531,7 +2764,7 @@ export default function App() {
                       </select>
                     </div>
                     <div className="agent-detail-row">
-                      <span className="detail-label">Seat</span>
+                      <span className="detail-label">{t('common.seat')}</span>
                       <select
                         className="detail-select"
                         value={selectedCard.seatId ?? ''}
@@ -2556,8 +2789,8 @@ export default function App() {
                 {cards.length > swarmAgents.length && (
                   <>
                     <div className="section-label">
-                      Characters
-                      <button className="inline-btn" onClick={() => setShowSubagents((v) => !v)}>{showSubagents ? 'hide sub' : 'show sub'}</button>
+                      {t('office.characters')}
+                      <button className="inline-btn" onClick={() => setShowSubagents((v) => !v)}>{showSubagents ? t('office.hideSub') : t('office.showSub')}</button>
                     </div>
                     <div className="agent-list">
                       {cards.filter((c) => !swarmAgents.some((a) => a.agent_id === c.id)).map((card) => (
@@ -2579,28 +2812,29 @@ export default function App() {
       {showDevTools && (
         <div className="dev-overlay">
           <div className="dev-header">
-            <span className="dev-title">Developer Tools</span>
+            <span className="dev-title">{t('dev.tools')}</span>
             <button className="icon-btn" onClick={() => setShowDevTools(false)}>✕</button>
           </div>
           <div className="dev-group">
-            <div className="dev-label">Connection</div>
+            <div className="dev-label">{t('dev.connection')}</div>
             <div className="input-row">
               <input value={wsUrlInput} onChange={(e) => setWsUrlInput(e.target.value)} placeholder="ws://..." />
               <button className="send-btn" onClick={applyWsUrl}>↩</button>
             </div>
           </div>
           <div className="dev-group">
-            <div className="dev-label">Evolution Pipeline</div>
+            <div className="dev-label">{t('dev.evolution')}</div>
             <div className="evo-pipeline">
               {(['Trace', 'Reflect', 'Synthesize', 'Practice', 'Lifecycle'] as const).map((phase, i) => {
                 const key = phase.toLowerCase() as keyof typeof evolutionPhases
                 const active = key in evolutionPhases ? evolutionPhases[key as 'trace' | 'reflect' | 'synthesize'] : false
+                const phaseLabelKey = `dev.phase.${key}` as Parameters<typeof t>[0]
                 return (
                   <div key={phase} className="evo-phase-group">
                     {i > 0 && <div className="evo-connector" />}
                     <div className={`evo-node ${active ? 'active' : ''}`}>
                       <div className="evo-dot" />
-                      <span className="evo-label">{phase}</span>
+                      <span className="evo-label">{t(phaseLabelKey)}</span>
                     </div>
                   </div>
                 )
@@ -2617,7 +2851,7 @@ export default function App() {
           </div>
           <div className="dev-group">
             <div className="dev-label">
-              Events
+              {t('dev.events')}
               <select className="inline-select" value={eventTypeFilter} onChange={(e) => setEventTypeFilter(e.target.value)}>
                 {eventTypes.map((type) => <option key={type} value={type}>{type}</option>)}
               </select>
@@ -2635,7 +2869,7 @@ export default function App() {
           </div>
           {Object.keys(snapshot?.channels ?? {}).length > 0 && (
             <div className="dev-group">
-              <div className="dev-label">Channels</div>
+              <div className="dev-label">{t('dev.channels')}</div>
               {Object.entries(snapshot?.channels ?? {}).map(([name, info]) => (
                 <div className="list-row" key={name}>
                   <span>{name}</span>

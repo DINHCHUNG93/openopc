@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 from opc.layer5_memory.markdown_memory import MarkdownMemoryStore
 from opc.plugins.office_ui.snapshot_builder import build_collab_sync, build_project_index_sync, build_snapshot
+from opc.project_id import project_id_policy
 
 from .context import OfficeServiceContext
 from .models import ServiceEvent, ServiceError, ServiceResult
@@ -79,12 +80,16 @@ class ProjectService:
                 except Exception:
                     logger.opt(exception=True).debug(f"Failed to close project store for {project_id}")
 
+    def _project_list_payload(self, active_project_id: str) -> dict[str, Any]:
+        return {
+            "projects": self.context.list_project_entries(),
+            "active_project_id": self.context.normalize_project_id(active_project_id),
+            "project_id_policy": project_id_policy(),
+        }
+
     async def list(self, *, active_project_id: str | None = None) -> ServiceResult:
         active = active_project_id or self.context.active_engine_project_id()
-        return ServiceResult({
-            "projects": self.context.list_project_entries(),
-            "active_project_id": self.context.normalize_project_id(active),
-        })
+        return ServiceResult(self._project_list_payload(active))
 
     async def create(self, project_id: str, *, active_project_id: str | None = None) -> ServiceResult:
         project_id = str(project_id or "").strip()
@@ -105,10 +110,9 @@ class ProjectService:
         memory_store.ensure_memory_file(project_id, f"# Project Memory ({project_id})")
         active = active_project_id or self.context.active_engine_project_id()
         return ServiceResult({
+            **self._project_list_payload(active),
             "action": "create_project",
             "project_id": project_id,
-            "projects": self.context.list_project_entries(),
-            "active_project_id": self.context.normalize_project_id(active),
         })
 
     async def rename(self, old_project_id: str, new_project_id: str) -> ServiceResult:
@@ -124,13 +128,12 @@ class ProjectService:
             raise ServiceError("invalid_project_id", "Invalid project_id (use alphanumeric, hyphens, underscores)")
         if old_id == new_id:
             return ServiceResult({
+                **self._project_list_payload(self.context.active_engine_project_id()),
                 "action": "rename_project",
                 "old_project_id": old_id,
                 "project_id": new_id,
                 "new_project_id": new_id,
                 "renamed": False,
-                "projects": self.context.list_project_entries(),
-                "active_project_id": self.context.active_engine_project_id(),
             })
 
         old_dir = self.context.project_dir(old_id)
@@ -182,13 +185,12 @@ class ProjectService:
         active_id = self.context.active_engine_project_id()
         events = [ServiceEvent("project_renamed", {"old_project_id": old_id, "project_id": new_id, "new_project_id": new_id})]
         payload: dict[str, Any] = {
+            **self._project_list_payload(active_id),
             "action": "rename_project",
             "old_project_id": old_id,
             "project_id": new_id,
             "new_project_id": new_id,
             "renamed": True,
-            "projects": self.context.list_project_entries(),
-            "active_project_id": active_id,
             "updated_task_tables": db_counts,
             "updated_ui_rows": chat_counts,
         }
@@ -240,14 +242,13 @@ class ProjectService:
             deleted_channels = int(await delete_chat(project_id) or 0)
             logger.info(f"Deleted {deleted_channels} channels for project '{project_id}'")
 
+        # Close every engine bound to this project AND evict its delegate from
+        # the root engine's cache; a stale delegate would otherwise be reused
+        # (with a closed store) if a project with the same id is re-created.
+        await self._close_project_engine_store(project_id)
+
         projects_dir = self.context.project_dir(project_id)
         if projects_dir.is_dir():
-            active_engine = self.context.engine
-            if was_active and getattr(active_engine, "store", None):
-                try:
-                    await active_engine.store.close()
-                except Exception:
-                    logger.opt(exception=True).debug("Failed to close active project store before delete")
             shutil.rmtree(str(projects_dir), ignore_errors=True)
 
         workplace = self.context.project_workplace(project_id)

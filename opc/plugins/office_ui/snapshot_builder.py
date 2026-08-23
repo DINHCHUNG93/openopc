@@ -16,10 +16,16 @@ import json
 import re
 import time
 import uuid
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 from opc.core.models import normalize_role_runtime_status
+from opc.core.transcript_visibility import (
+    FULL_DETAIL_ONLY_TRANSCRIPT_KINDS,
+    TranscriptDetailLevel,
+    normalize_transcript_detail_level,
+    transcript_metadata_visible,
+)
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     IN_PROGRESS_PHASES,
@@ -32,6 +38,11 @@ from opc.layer2_organization.phase import (
     kanban_column,
     should_hide_work_item_from_company_kanban,
     verdict,
+)
+from opc.layer2_organization.company_runtime_identity import (
+    ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
+    COMPANY_RUNTIME_CHECKPOINT_TYPES,
+    build_company_runtime_identity_index,
 )
 from opc.layer2_organization.work_item_context_view import WorkItemContextView
 from opc.layer2_organization.work_item_identity import (
@@ -118,14 +129,7 @@ def _session_message_ui_identity(message: Any) -> tuple[str, float, dict[str, An
     return canonical_id or str(getattr(message, "message_id", "") or ""), timestamp, ui_meta
 
 
-TranscriptDetailLevel = Literal["summary", "full"]
-
-_FULL_DETAIL_ONLY_TRANSCRIPT_KINDS: frozenset[str] = frozenset({
-    "runtime_v2_user_turn",
-    "runtime_v2_intermediate_assistant",
-    "runtime_v2_company_assistant",
-    "runtime_v2_tool_output",
-})
+_FULL_DETAIL_ONLY_TRANSCRIPT_KINDS = FULL_DETAIL_ONLY_TRANSCRIPT_KINDS
 
 _TRANSCRIPT_DUPLICATE_KIND_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({
@@ -188,30 +192,37 @@ def _normalize_duplicate_content(content: Any) -> str:
 
 def _strip_narrative_title_prefix(content: str) -> str:
     trimmed = str(content or "").strip()
-    markdown_title = re.match(r"^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$", trimmed)
-    if markdown_title:
+    # Comparison-only canonicalization may unwrap a deliberate leading title,
+    # but must never interpret a colon inside ordinary Markdown body text as a
+    # wrapper boundary.  Resolve explicit nested wrappers to a fixed point so
+    # the comparison key itself is idempotent.
+    while True:
+        markdown_title = re.match(r"^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$", trimmed)
+        if not markdown_title:
+            return trimmed
         body = markdown_title.group(2).strip()
-        if len(body) >= 80:
-            return body
-    colon_index = trimmed.find(": ")
-    if colon_index < 8 or colon_index > 160:
-        return trimmed
-    prefix = trimmed[:colon_index].replace("*", "").strip()
-    body = trimmed[colon_index + 2 :].strip()
-    if len(body) < 80:
-        return trimmed
-    if not re.search(r"[A-Za-z\u4e00-\u9fff]", prefix):
-        return trimmed
-    if re.match(r"^(https?|file)$", prefix, flags=re.IGNORECASE):
-        return trimmed
-    return body
+        if len(body) < 80 or body == trimmed:
+            return trimmed
+        trimmed = body
+
+
+def _select_duplicate_display_content(
+    preferred: dict[str, Any],
+    secondary: dict[str, Any],
+) -> str:
+    """Return one original surface body, never the lossy comparison key."""
+    preferred_content = str(preferred.get("content", "") or "")
+    secondary_content = str(secondary.get("content", "") or "")
+    preferred_key = _normalize_duplicate_content(preferred_content)
+    if not preferred_key or preferred_key != _normalize_duplicate_content(secondary_content):
+        return preferred_content
+    if secondary_content.strip() == preferred_key and preferred_content.strip() != preferred_key:
+        return secondary_content
+    return preferred_content
 
 
 def _normalize_transcript_detail_level(value: Any) -> TranscriptDetailLevel:
-    normalized = str(value or "").strip().lower()
-    if normalized == "full":
-        return "full"
-    return "summary"
+    return normalize_transcript_detail_level(value)
 
 
 def _transcript_message_kind(message: Any) -> str:
@@ -229,8 +240,7 @@ def _transcript_message_hidden_from_ui(
     detail_level: TranscriptDetailLevel = "summary",
 ) -> bool:
     metadata = dict(getattr(message, "metadata", {}) or {})
-    kind = str(metadata.get("kind", "") or "").strip()
-    return detail_level != "full" and kind in _FULL_DETAIL_ONLY_TRANSCRIPT_KINDS
+    return not transcript_metadata_visible(metadata, detail_level=detail_level)
 
 
 def _render_text_parts(parts: list[Any]) -> str:
@@ -1122,13 +1132,29 @@ def _transcript_item_to_ui_message(
             "role": role,
             "task_id": task_id,
             "transcript_kind": kind,
-            "detail_visibility": _transcript_message_visibility(kind),
+            "detail_visibility": (
+                "summary"
+                if message_metadata.get("company_final_turn")
+                else _transcript_message_visibility(kind)
+            ),
             **({"type": "system"} if kind == "runtime_v2_user_turn" else {}),
             **({"verification_verdict": verification_footer} if verification_footer else {}),
             **({"runtime_thinking": runtime_thinking} if runtime_thinking else {}),
             **({
                 key: message_metadata.get(key)
-                for key in ("canonical_turn_id", "turn_id")
+                for key in (
+                    "canonical_turn_id",
+                    "turn_id",
+                    "result_delivery_id",
+                    "source_result_message_id",
+                    "source_task_id",
+                    "child_session_id",
+                    "conversation_turn_id",
+                    "execution_turn_id",
+                    "work_item_projection_id",
+                    "work_item_turn_type",
+                    "runtime_session_id",
+                )
                 if message_metadata.get(key)
             }),
             **ui_meta,
@@ -1159,7 +1185,14 @@ def _prefer_duplicate_message(left: dict[str, Any], right: dict[str, Any]) -> tu
     return right, left
 
 
-def _collapse_adjacent_transcript_duplicates(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def collapse_adjacent_transcript_duplicates(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate rendered result surfaces in chronological order.
+
+    This is public within the Office UI package because transcript pagination
+    formats raw database chunks incrementally.  Reusing the renderer's exact
+    collapse rule at chunk boundaries keeps pagination and full snapshots
+    identical.
+    """
     collapsed: list[dict[str, Any]] = []
     for message in messages:
         if not collapsed:
@@ -1182,18 +1215,10 @@ def _collapse_adjacent_transcript_duplicates(messages: list[dict[str, Any]]) -> 
         ):
             merged_visibility = "full"
         merged_metadata["detail_visibility"] = merged_visibility
-        preferred_content = str(preferred.get("content", "") or "")
-        secondary_content = str(secondary.get("content", "") or "")
-        normalized_content = _normalize_duplicate_content(preferred_content)
-        merged_content = (
-            normalized_content
-            if normalized_content and normalized_content == _normalize_duplicate_content(secondary_content)
-            else preferred_content
-        )
         collapsed[-1] = {
             **secondary,
             **preferred,
-            "content": merged_content,
+            "content": _select_duplicate_display_content(preferred, secondary),
             "metadata": merged_metadata,
         }
     return collapsed
@@ -1227,7 +1252,7 @@ def build_transcript_ui_messages(
             "metadata": dict(formatted.get("metadata", {}) or {}),
         })
 
-    collapsed_messages = _collapse_adjacent_transcript_duplicates(formatted_messages)
+    collapsed_messages = collapse_adjacent_transcript_duplicates(formatted_messages)
     normalized_detail_level = _normalize_transcript_detail_level(detail_level)
     if normalized_detail_level == "full":
         return collapsed_messages
@@ -1497,6 +1522,11 @@ def _primary_session_tasks_by_session_id(
     *,
     task_meta_map: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
+    identity_index = build_company_runtime_identity_index(tasks)
+    company_identities = {
+        identity.runtime_session_id: identity
+        for identity in identity_index.identities
+    }
     primary_tasks_by_session_id: dict[str, Any] = {}
     ordered_session_ids: list[str] = []
     for task in tasks:
@@ -1507,6 +1537,19 @@ def _primary_session_tasks_by_session_id(
         if bool(task_meta.get("review_task", False)):
             continue
         session_id = str(getattr(task, "session_id", "") or "").strip()
+        company_identity = company_identities.get(session_id)
+        if company_identity is not None:
+            anchor = identity_index.task(company_identity.ui_anchor_task_id)
+            if anchor is not None and session_id not in primary_tasks_by_session_id:
+                primary_tasks_by_session_id[session_id] = anchor
+                ordered_session_ids.append(session_id)
+            if anchor is not None:
+                # A shared final-decider/work-item Task must never replace a
+                # pure UI anchor that owns the same session id.
+                continue
+            # Without a pure anchor this scope has no primary chat container.
+            # Never synthesize one from a role/work-item Task.
+            continue
         if not session_id or _task_parent_session_link(task, task_meta):
             continue
         current = primary_tasks_by_session_id.get(session_id)
@@ -1524,31 +1567,16 @@ def _primary_session_tasks_by_session_id(
     return primary_tasks_by_session_id, ordered_session_ids
 
 
-def _shared_role_identity_tasks_by_session_id(
+def _company_config_source_tasks_by_session_id(
     tasks: list[Any],
-    *,
-    task_meta_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    identity_tasks_by_session_id: dict[str, Any] = {}
-    for task in tasks:
-        task_id = str(getattr(task, "id", "") or "").strip()
-        task_meta = (
-            task_meta_map.get(task_id, {}) if task_meta_map is not None and task_id else _task_metadata(task)
-        )
-        session_id = _shared_role_session_key(task, task_meta)
-        if not session_id:
-            continue
-        current = identity_tasks_by_session_id.get(session_id)
-        if current is None:
-            identity_tasks_by_session_id[session_id] = task
-            continue
-        current_id = str(getattr(current, "id", "") or "").strip()
-        current_meta = (
-            task_meta_map.get(current_id, {}) if task_meta_map is not None and current_id else _task_metadata(current)
-        )
-        if _session_representative_rank(task, task_meta) > _session_representative_rank(current, current_meta):
-            identity_tasks_by_session_id[session_id] = task
-    return identity_tasks_by_session_id
+    identity_index = build_company_runtime_identity_index(tasks)
+    return {
+        identity.runtime_session_id: task
+        for identity in identity_index.identities
+        if identity.config_source_task_id
+        and (task := identity_index.task(identity.config_source_task_id)) is not None
+    }
 
 
 async def build_company_kanban_projection(
@@ -2588,31 +2616,7 @@ async def _build_company_runtime_control_by_task(
     if not store:
         return {}
 
-    parent_task_by_session: dict[str, str] = {}
-    tasks_by_parent_session: dict[str, list[Any]] = {}
-    for task in tasks:
-        metadata = dict(getattr(task, "metadata", {}) or {})
-        mode = str(metadata.get("mode", "") or metadata.get("exec_mode", "") or "").strip().lower()
-        is_company_runtime_task = bool(
-            mode in {"company", "org", "custom"}
-            or str(getattr(task, "parent_session_id", "") or "").strip()
-            or metadata.get("company_profile")
-            or metadata.get("company_work_item_plan")
-            or metadata.get("work_item_runtime")
-            or metadata.get("work_item_projection_id")
-        )
-        if not is_company_runtime_task:
-            continue
-        session_id = str(getattr(task, "session_id", "") or "").strip()
-        parent_session_id = str(getattr(task, "parent_session_id", "") or "").strip()
-        task_id = str(getattr(task, "id", "") or "").strip()
-        if session_id and not parent_session_id:
-            parent_task_by_session[session_id] = task_id
-        runtime_parent_session_id = parent_session_id or session_id
-        if runtime_parent_session_id:
-            tasks_by_parent_session.setdefault(runtime_parent_session_id, []).append(task)
-
-    checkpoints_by_session: dict[str, Any] = {}
+    checkpoints: list[Any] = []
     getter = getattr(store, "get_execution_checkpoints", None)
     if not callable(getter):
         getter = getattr(store, "get_pending_checkpoints", None)
@@ -2620,61 +2624,71 @@ async def _build_company_runtime_control_by_task(
         try:
             kwargs = {
                 "project_id": project_id,
-                "checkpoint_types": ["company_runtime_suspended", "company_runtime_interrupted"],
+                "checkpoint_types": sorted(COMPANY_RUNTIME_CHECKPOINT_TYPES),
             }
             if getattr(getter, "__name__", "") == "get_execution_checkpoints":
-                kwargs["statuses"] = ["pending", "resuming"]
+                kwargs["statuses"] = sorted(ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES)
             checkpoints = await getter(**kwargs)
-            for checkpoint in checkpoints:
-                sid = str(getattr(checkpoint, "session_id", "") or "").strip()
-                if sid and sid not in checkpoints_by_session:
-                    checkpoints_by_session[sid] = checkpoint
         except Exception:
             logger.opt(exception=True).debug("snapshot: failed to load company runtime checkpoints")
+            checkpoints = []
+
+    identity_index = build_company_runtime_identity_index(tasks, checkpoints)
 
     result: dict[str, dict[str, Any]] = {}
-    for parent_session_id, group in tasks_by_parent_session.items():
-        checkpoint = checkpoints_by_session.get(parent_session_id)
-        parent_task_id = parent_task_by_session.get(parent_session_id, "")
-        if not parent_task_id:
-            for task in group:
-                if not str(getattr(task, "parent_session_id", "") or "").strip():
-                    parent_task_id = str(getattr(task, "id", "") or "").strip()
-                    break
-        if not parent_task_id and group:
-            parent_task_id = str(getattr(group[0], "id", "") or "").strip()
-
-        def _task_status_value(task: Any) -> str:
-            status = getattr(task, "status", "")
-            if hasattr(status, "value"):
-                return str(status.value or "").strip().lower()
-            return str(status or "").strip().lower().removeprefix("taskstatus.")
-
-        non_terminal_group = [
-            task for task in group
-            if _task_status_value(task) not in {"done", "failed", "cancelled"}
+    for identity in identity_index.identities:
+        group = [
+            task
+            for task_id in identity.runtime_task_ids
+            if (task := identity_index.task(task_id)) is not None
         ]
-        has_running_task = any(
-            _task_status_value(task) == "running"
-            for task in non_terminal_group
-        )
+        checkpoint = identity.checkpoint
+
+        # Persisted RUNNING is only a projection.  The controller-local
+        # execution registry is the sole proof that this process still owns a
+        # coroutine capable of monitoring and persisting the run.  Driver
+        # ownership can deliberately sit on a terminal work-item envelope
+        # while the resumed scheduler is still active, so Task.status must not
+        # filter this lookup.
+        runtime_is_live = getattr(engine, "_task_runtime_is_live", None)
+        has_running_task = False
+        if callable(runtime_is_live):
+            for task in group:
+                live_result = runtime_is_live(task)
+                if inspect.isawaitable(live_result):
+                    live_result = await live_result
+                if live_result is True:
+                    has_running_task = True
+                    break
         any_stop_in_progress = any(
             str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip()
             in {"suspending", "suspended", "resuming_after_suspending"}
             and bool(str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_marked_at", "") or "").strip())
-            for task in non_terminal_group
+            for task in group
         )
         any_held_suspended = any(
             str((getattr(task, "metadata", {}) or {}).get("dispatch_hold", "") or "").strip()
             == "company_runtime_suspended"
-            for task in non_terminal_group
+            for task in group
         )
         any_resuming = any(
             str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip() == "resuming"
-            for task in non_terminal_group
+            for task in group
         )
         checkpoint_status = str(getattr(checkpoint, "status", "") or "").strip().lower() if checkpoint is not None else ""
-        if any_resuming or checkpoint_status == "resuming":
+        # ``resuming`` is the durable checkpoint claim for the whole resumed
+        # execution, not merely a short UI transition.  Once the controller
+        # registry proves that execution ownership exists, the runtime is
+        # stoppable and must project as running until that ownership ends.
+        if checkpoint_status == "pending":
+            state = "suspended"
+        elif checkpoint_status == "resuming" and (
+            any_held_suspended or any_stop_in_progress
+        ):
+            state = "suspending"
+        elif checkpoint_status == "resuming" and has_running_task:
+            state = "running"
+        elif any_resuming or checkpoint_status == "resuming":
             state = "resuming"
         elif checkpoint is not None:
             state = "suspended"
@@ -2683,7 +2697,7 @@ async def _build_company_runtime_control_by_task(
             and any(
                 str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip()
                 in {"suspending", "resuming_after_suspending"}
-                for task in non_terminal_group
+                for task in group
             )
         ):
             state = "suspending"
@@ -2702,8 +2716,7 @@ async def _build_company_runtime_control_by_task(
                 "runtime_control_state": state,
                 "can_stop": state == "running",
                 "can_resume": state == "suspended",
-                "resume_parent_task_id": parent_task_id,
-                "resume_parent_session_id": parent_session_id,
+                "resume_parent_session_id": identity.runtime_session_id,
                 "pending_runtime_checkpoint_id": pending_checkpoint_id,
                 "stop_intent_id": str(checkpoint_payload.get("stop_intent_id", "") or ""),
             }
@@ -3008,9 +3021,8 @@ async def build_project_index_sync(
         session_tasks,
         task_meta_map=task_meta_map,
     )
-    shared_identity_tasks_by_session_id = _shared_role_identity_tasks_by_session_id(
+    company_config_tasks_by_session_id = _company_config_source_tasks_by_session_id(
         session_tasks,
-        task_meta_map=task_meta_map,
     )
     child_tasks_by_parent: dict[str, list[Any]] = {}
     for task in session_tasks:
@@ -3081,11 +3093,12 @@ async def build_project_index_sync(
         representative_task = primary_tasks_by_session_id.get(session_id)
         representative_task_id = str(getattr(representative_task, "id", "") or "").strip()
         shared_session_id = _shared_role_session_key(t, t_meta)
-        if shared_session_id and representative_task_id and representative_task_id != task_id:
-            continue
+        if shared_session_id:
+            if not representative_task_id or representative_task_id != task_id:
+                continue
         identity_task = t
         identity_meta = t_meta
-        shared_identity_task = shared_identity_tasks_by_session_id.get(session_id)
+        shared_identity_task = company_config_tasks_by_session_id.get(session_id)
         shared_identity_task_id = str(getattr(shared_identity_task, "id", "") or "").strip()
         if shared_identity_task_id and shared_identity_task_id != task_id:
             identity_task = shared_identity_task
@@ -3563,9 +3576,8 @@ async def build_collab_sync(
         session_tasks,
         task_meta_map=task_meta_map,
     )
-    shared_identity_tasks_by_session_id = _shared_role_identity_tasks_by_session_id(
+    company_config_tasks_by_session_id = _company_config_source_tasks_by_session_id(
         session_tasks,
-        task_meta_map=task_meta_map,
     )
     child_tasks_by_parent: dict[str, list[Any]] = {}
     for task in session_tasks:
@@ -3610,11 +3622,15 @@ async def build_collab_sync(
         representative_task = primary_tasks_by_session_id.get(session_id)
         representative_task_id = str(getattr(representative_task, "id", "") or "").strip()
         shared_session_id = _shared_role_session_key(t, t_meta)
-        if shared_session_id and representative_task_id and representative_task_id != str(getattr(t, "id", "") or "").strip():
-            continue
+        if shared_session_id:
+            if (
+                not representative_task_id
+                or representative_task_id != str(getattr(t, "id", "") or "").strip()
+            ):
+                continue
         identity_task = t
         identity_meta = t_meta
-        shared_identity_task = shared_identity_tasks_by_session_id.get(session_id)
+        shared_identity_task = company_config_tasks_by_session_id.get(session_id)
         shared_identity_task_id = str(getattr(shared_identity_task, "id", "") or "").strip()
         if shared_identity_task_id and shared_identity_task_id != str(getattr(t, "id", "") or "").strip():
             identity_task = shared_identity_task

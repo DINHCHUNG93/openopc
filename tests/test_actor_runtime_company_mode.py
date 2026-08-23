@@ -11,6 +11,7 @@ from opc.core.events import EventBus
 from opc.core.models import CompanyMemberSession, DelegationWorkItem, Phase, SeatState, Task, TaskResult, TaskStatus
 from opc.database.store import OPCStore
 from opc.layer2_organization.communication import CommunicationManager
+from opc.layer2_organization.phase import DONE_PHASES
 from opc.layer2_organization.company_mode import CompanyWorkItemExecutor
 from opc.layer2_organization.company_runtime import CompanyRuntime
 from opc.layer2_organization.org_engine import OrgEngine
@@ -36,6 +37,7 @@ from opc.layer2_organization.work_item_identity import (
     migrate_work_item_projection_metadata,
     projection_id_for_work_item,
     rework_projection_id_for_gate,
+    result_delivery_identity_payload_for_task,
     target_projection_id_for_decision,
     target_projection_ids_for_decision,
     work_item_identity_payload,
@@ -215,6 +217,52 @@ class WorkItemProjectionIdentityTests(unittest.TestCase):
 
         self.assertEqual(payload[WORK_ITEM_PROJECTION_ID_KEY], "task-proj")
         self.assertEqual(payload[WORK_ITEM_TURN_TYPE_KEY], "report")
+
+    def test_result_delivery_identity_uses_canonical_turn_and_retry_attempt(self) -> None:
+        task = SimpleNamespace(
+            id="task-1",
+            retry_count=2,
+            metadata={"runtime_v2_current_turn_id": "canonical-turn-1"},
+        )
+
+        payload = result_delivery_identity_payload_for_task(task)
+
+        self.assertEqual(
+            payload["result_delivery_id"],
+            "result:task:task-1:turn:canonical-turn-1:attempt:2",
+        )
+        self.assertEqual(payload["source_task_id"], "task-1")
+        self.assertEqual(payload["canonical_turn_id"], "canonical-turn-1")
+
+    def test_result_delivery_identity_does_not_collide_for_parallel_tasks(self) -> None:
+        first = SimpleNamespace(id="task-1", retry_count=0, metadata={})
+        second = SimpleNamespace(id="task-2", retry_count=0, metadata={})
+
+        first_payload = result_delivery_identity_payload_for_task(
+            first,
+            canonical_turn_id="shared-parent-turn",
+        )
+        second_payload = result_delivery_identity_payload_for_task(
+            second,
+            canonical_turn_id="shared-parent-turn",
+        )
+
+        self.assertNotEqual(
+            first_payload["result_delivery_id"],
+            second_payload["result_delivery_id"],
+        )
+        self.assertIn(":task-1:", first_payload["result_delivery_id"])
+        self.assertIn(":task-2:", second_payload["result_delivery_id"])
+
+    def test_result_delivery_identity_requires_an_execution_scope(self) -> None:
+        task = SimpleNamespace(id="reused-task", retry_count=0, metadata={})
+
+        self.assertEqual(result_delivery_identity_payload_for_task(task), {
+            "source_task_id": "reused-task",
+        })
+        first = result_delivery_identity_payload_for_task(task, execution_id="execution-1")
+        second = result_delivery_identity_payload_for_task(task, execution_id="execution-2")
+        self.assertNotEqual(first["result_delivery_id"], second["result_delivery_id"])
 
     def test_migrate_projection_metadata_backfills_from_fallbacks_without_overwriting(self) -> None:
         migrated, changed = migrate_work_item_projection_metadata(
@@ -837,6 +885,77 @@ class ActorRuntimeManagerDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
             "This turn is a root-only scoping decision before any downstream split.",
         )
 
+    async def test_manager_dispatch_guard_accepts_markdown_decorated_justification(self) -> None:
+        """Project-4444 regression: the CTO wrote the escape line as
+        `**NO_DELEGATION_JUSTIFICATION**:` and the bare startswith parser
+        missed it, driving the work item to FAILED. Decorated variants must
+        all parse."""
+        variants = [
+            ("**NO_DELEGATION_JUSTIFICATION**: The task needs my own research.",
+             "The task needs my own research."),
+            ("**NO_DELEGATION_JUSTIFICATION: Whole line is bold.**",
+             "Whole line is bold."),
+            ("- NO_DELEGATION_JUSTIFICATION: Listed as a bullet.",
+             "Listed as a bullet."),
+            ("### NO_DELEGATION_JUSTIFICATION: Written as a heading.",
+             "Written as a heading."),
+            ("NO_DELEGATION_JUSTIFICATION： Fullwidth colon variant.",
+             "Fullwidth colon variant."),
+        ]
+        for content, expected in variants:
+            with self.subTest(content=content):
+                self.task.metadata.pop("manager_no_delegation_justification", None)
+                before = await self.executor._snapshot_manager_dispatch_state(self.task)
+                issues = await self.executor._enforce_manager_dispatch_guard(
+                    self.task,
+                    TaskResult(status=TaskStatus.DONE, content=f"Some preamble.\n{content}"),
+                    before_state=before,
+                )
+                self.assertEqual(issues, [])
+                self.assertEqual(
+                    self.task.metadata["manager_no_delegation_justification"],
+                    expected,
+                )
+
+    async def test_manager_dispatch_guard_ignores_echoed_instruction_template(self) -> None:
+        """Echoing the guard's own `NO_DELEGATION_JUSTIFICATION: <specific
+        reason>` template is not a justification — including with trailing
+        punctuation or quoting around the placeholder."""
+        echoes = [
+            "I should finish with `NO_DELEGATION_JUSTIFICATION: <specific reason>` next time.",
+            "NO_DELEGATION_JUSTIFICATION: <specific reason>.",
+            'NO_DELEGATION_JUSTIFICATION: "<specific reason>"',
+            "NO_DELEGATION_JUSTIFICATION: **<specific reason>**",
+            "NO_DELEGATION_JUSTIFICATION: _<specific reason>_",
+        ]
+        for content in echoes:
+            with self.subTest(content=content):
+                self.task.metadata.pop("manager_no_delegation_justification", None)
+                before = await self.executor._snapshot_manager_dispatch_state(self.task)
+                issues = await self.executor._enforce_manager_dispatch_guard(
+                    self.task,
+                    TaskResult(status=TaskStatus.DONE, content=content),
+                    before_state=before,
+                )
+                self.assertEqual(len(issues), 1)
+                self.assertNotIn("manager_no_delegation_justification", self.task.metadata)
+
+    async def test_manager_dispatch_guard_ignores_placeholder_in_artifacts(self) -> None:
+        """The artifact/metadata escape hatch gets the same placeholder
+        filter as the free-text line."""
+        before = await self.executor._snapshot_manager_dispatch_state(self.task)
+        issues = await self.executor._enforce_manager_dispatch_guard(
+            self.task,
+            TaskResult(
+                status=TaskStatus.DONE,
+                content="Done.",
+                artifacts={"no_delegation_justification": "<specific reason>."},
+            ),
+            before_state=before,
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertNotIn("manager_no_delegation_justification", self.task.metadata)
+
     async def test_manager_dispatch_guard_rejects_no_delegation_for_collab_infra_failure(self) -> None:
         before = await self.executor._snapshot_manager_dispatch_state(self.task)
 
@@ -895,6 +1014,7 @@ class ActorRuntimeManagerDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(issues, [])
+        self.assertTrue(self.task.metadata.get("manager_board_mutation_performed"))
 
     async def test_manager_dispatch_guard_accepts_existing_child_mutation(self) -> None:
         await self.store.save_delegation_work_item(
@@ -940,6 +1060,474 @@ class ActorRuntimeManagerDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(issues, [])
+        self.assertTrue(self.task.metadata.get("manager_board_mutation_performed"))
+
+    async def test_manager_dispatch_guard_accepts_existing_child_deletion(self) -> None:
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id="cto-child-item",
+                run_id="run-1",
+                cell_id="team::ceo",
+                team_instance_id="team-instance::run-1::team::ceo",
+                team_id="team::ceo",
+                role_id="cto",
+                seat_id="seat::team::ceo::cto",
+                seat_state_id="seat-state::run-1::seat::team::ceo::cto",
+                role_runtime_session_id="role-runtime::run-1::seat::team::ceo::cto",
+                parent_work_item_id="ceo-work-item",
+                title="Obsolete CTO Work",
+                summary="Remove this obsolete branch.",
+                kind="execute",
+                projection_id="cto-child-item",
+                phase=Phase.RUNNING,
+                manager_role_id="ceo",
+                manager_seat_id="seat::team::ceo::ceo",
+                metadata={
+                    "work_item_runtime": True,
+                    "runtime_model": "multi_team_org",
+                    "manager_mutation_revision": 0,
+                },
+            )
+        )
+        before = await self.executor._snapshot_manager_dispatch_state(self.task)
+        await self.store.amend_delegation_work_item(
+            "cto-child-item",
+            metadata_set={
+                "manager_mutation_revision": 1,
+                "manager_mutation_action": "delete",
+                "deleted_by_manager_tool": True,
+                "hidden_from_company_kanban": True,
+                "upstream_visibility": "hidden",
+            },
+        )
+
+        issues = await self.executor._enforce_manager_dispatch_guard(
+            self.task,
+            TaskResult(status=TaskStatus.DONE, content="Deleted the obsolete child work item."),
+            before_state=before,
+        )
+
+        self.assertEqual(issues, [])
+        self.assertTrue(self.task.metadata.get("manager_board_mutation_performed"))
+
+    async def test_historical_dependency_does_not_satisfy_current_turn_guard(self) -> None:
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id="historical-child",
+                run_id="run-1",
+                parent_work_item_id="ceo-work-item",
+                role_id="cto",
+                seat_id="seat::team::ceo::cto",
+                title="Historical child",
+                summary="Created in an earlier turn.",
+                kind="execute",
+                projection_id="historical-child",
+                phase=Phase.APPROVED,
+                metadata={"work_item_runtime": True, "runtime_model": "multi_team_org"},
+            )
+        )
+        self.task.metadata["delegation_wait_for_work_item_ids"] = ["historical-child"]
+        before = await self.executor._snapshot_manager_dispatch_state(self.task)
+
+        issues = await self.executor._enforce_manager_dispatch_guard(
+            self.task,
+            TaskResult(status=TaskStatus.DONE, content="Handled this new request directly."),
+            before_state=before,
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertFalse(self.task.metadata.get("manager_board_mutation_performed", False))
+
+    async def test_attention_child_created_during_turn_does_not_satisfy_dispatch_guard(self) -> None:
+        before = await self.executor._snapshot_manager_dispatch_state(self.task)
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id="ceo-attention-item",
+                run_id="run-1",
+                parent_work_item_id="ceo-work-item",
+                role_id="ceo",
+                seat_id="seat::team::ceo::ceo",
+                title="CEO attention",
+                summary="Runtime wake-up wrapper, not delegated business work.",
+                kind="monitor",
+                projection_id="ceo-attention-item",
+                phase=Phase.READY,
+                metadata={
+                    "work_item_runtime": True,
+                    "runtime_model": "multi_team_org",
+                    "attention_work_item": True,
+                },
+            )
+        )
+
+        issues = await self.executor._enforce_manager_dispatch_guard(
+            self.task,
+            TaskResult(status=TaskStatus.DONE, content="Handled this request directly."),
+            before_state=before,
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertFalse(self.task.metadata.get("manager_board_mutation_performed", False))
+
+    async def test_manager_dispatch_guard_exhaustion_accepts_turn_instead_of_failing(self) -> None:
+        # Dispatch is a soft constraint: when the guard reminders run out,
+        # the turn output is accepted as normal completion (annotated via
+        # `manager_dispatch_guard_unresolved`) instead of flipping the work
+        # item to FAILED — not every task needs every seat to delegate.
+        # No lifecycle helpers are mocked: the whole turn loop runs against
+        # the real store, so the review chain must actually materialize.
+        task = await self._make_cto_dispatch_task(
+            metadata_extra={
+                "manager_dispatch_guard_max_retries": 1,
+                "direct_report_role_ids": ["dev"],
+                "direct_report_seat_ids": ["seat::team::cto::dev"],
+                # Stale flag from an imaginary earlier delegating turn: the
+                # per-turn reset must clear it, otherwise the guard would
+                # silently pass without reminders.
+                "manager_board_mutation_performed": True,
+                "manager_board_modified_work_item_ids": ["stale-modified-child"],
+                "manager_board_deleted_work_item_ids": ["stale-deleted-child"],
+                "manager_no_delegation_justification": "stale reason from an earlier turn",
+                "no_delegation_justification": "another stale reason",
+                "manager_dispatch_guard_unresolved": "stale unresolved guard",
+            },
+        )
+        task.status = TaskStatus.PENDING
+        self.executor.execute_task = AsyncMock(
+            side_effect=[
+                TaskResult(status=TaskStatus.DONE, content="Scoped and handled the work directly."),
+                TaskResult(status=TaskStatus.DONE, content="Still handled directly; no delegation needed."),
+            ]
+        )
+
+        result = await self.executor._run_work_item(task, {})
+
+        self.assertIsNotNone(result)
+        self.assertNotEqual(result.status, TaskStatus.FAILED)
+        # The reminder loop still ran once before acceptance (proves the
+        # stale mutation flag was reset at turn start).
+        self.assertEqual(self.executor.execute_task.await_count, 2)
+        self.assertIn(
+            "delegate_work",
+            str(task.metadata.get("manager_dispatch_guard_unresolved", "")),
+        )
+        # Self-produced manager output goes through manager review: the
+        # card waits for CEO review and a live report card drives it.
+        work_item = await self.store.get_delegation_work_item("cto-dispatch-item")
+        self.assertEqual(work_item.phase, Phase.AWAITING_MANAGER_REVIEW)
+        self.assertNotIn("manager_board_mutation_performed", task.metadata)
+        self.assertNotIn("manager_board_modified_work_item_ids", task.metadata)
+        self.assertNotIn("manager_board_deleted_work_item_ids", task.metadata)
+        self.assertNotIn("manager_no_delegation_justification", task.metadata)
+        self.assertNotIn("no_delegation_justification", task.metadata)
+        self.assertNotIn("stale unresolved guard", task.metadata["manager_dispatch_guard_unresolved"])
+        dispatch_evidence = dict(
+            dict((work_item.metadata or {}).get("review_evidence", {}) or {}).get(
+                "manager_dispatch", {}
+            )
+            or {}
+        )
+        self.assertEqual(dispatch_evidence.get("outcome"), "self_produced")
+        self.assertEqual(dispatch_evidence.get("source"), "dispatch_guard_exhausted")
+        self.assertNotIn("turn_output_kind", work_item.metadata or {})
+        self.assertNotIn("turn_output_source", work_item.metadata or {})
+        report_cards = await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")
+        self.assertEqual(len(report_cards), 1)
+        self.assertNotIn(report_cards[0].phase, DONE_PHASES)
+
+    async def _aux_cards_targeting(self, work_item_id: str, key: str) -> list[DelegationWorkItem]:
+        run_items = await self.store.list_delegation_work_items("run-1")
+        return [
+            item for item in run_items
+            if str((item.metadata or {}).get(key, "") or "").strip() == work_item_id
+        ]
+
+    async def _make_cto_dispatch_task(self, *, metadata_extra: dict | None = None) -> Task:
+        task = Task(
+            id="cto-dispatch-task",
+            title="CTO Dispatch",
+            project_id="proj1",
+            assigned_to="cto",
+            status=TaskStatus.DONE,
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": "multi_team_org",
+                "delegation_run_id": "run-1",
+                "delegation_seat_id": "seat::team::ceo::cto",
+                "current_turn_mode": "dispatch_required",
+                "work_kind": "dispatch",
+                "manager_role_id": "ceo",
+                "manager_seat_id": "seat::team::ceo::ceo",
+                **(metadata_extra or {}),
+            },
+        )
+        set_linked_work_item_id(task, "cto-dispatch-item")
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id="cto-dispatch-item",
+                run_id="run-1",
+                cell_id="team::ceo",
+                team_instance_id="team-instance::run-1::team::ceo",
+                team_id="team::ceo",
+                role_id="cto",
+                seat_id="seat::team::ceo::cto",
+                seat_state_id="seat-state::run-1::seat::team::ceo::cto",
+                role_runtime_session_id="role-runtime::run-1::seat::team::ceo::cto",
+                title="CTO Dispatch",
+                summary="Route the engineering work.",
+                kind="dispatch",
+                projection_id="cto-dispatch-item",
+                phase=Phase.RUNNING,
+                manager_role_id="ceo",
+                manager_seat_id="seat::team::ceo::ceo",
+                metadata={"work_item_runtime": True, "runtime_model": "multi_team_org"},
+            )
+        )
+        return task
+
+    async def test_self_produced_dispatch_runs_full_report_review_chain(self) -> None:
+        # Real store, no lifecycle mocks: justified self-produced dispatch
+        # output must route to manager review, actually spawn the report
+        # card, and — once the report turn finishes — actually spawn the
+        # review card in the manager seat.
+        task = await self._make_cto_dispatch_task(
+            metadata_extra={"manager_no_delegation_justification": "single-seat scoping decision"},
+        )
+
+        phase = await self.executor._apply_done_transition(
+            task, result=TaskResult(status=TaskStatus.DONE, content="Scoped the work; no delegation needed."),
+        )
+
+        self.assertEqual(phase, Phase.AWAITING_MANAGER_REVIEW)
+        work_item = await self.store.get_delegation_work_item("cto-dispatch-item")
+        self.assertEqual(work_item.phase, Phase.AWAITING_MANAGER_REVIEW)
+        dispatch_evidence = dict(
+            dict((work_item.metadata or {}).get("review_evidence", {}) or {}).get(
+                "manager_dispatch", {}
+            )
+            or {}
+        )
+        self.assertEqual(dispatch_evidence.get("outcome"), "self_produced")
+        self.assertEqual(dispatch_evidence.get("source"), "justified")
+        self.assertEqual(dispatch_evidence.get("note"), "single-seat scoping decision")
+        self.assertNotIn("turn_output_kind", work_item.metadata or {})
+        self.assertNotIn("turn_output_source", work_item.metadata or {})
+        report_cards = await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")
+        self.assertEqual(len(report_cards), 1)
+        report_card = report_cards[0]
+        self.assertNotIn(report_card.phase, DONE_PHASES)
+
+        # Drive the report turn to completion — the review card must appear.
+        # Production dispatch claims READY → RUNNING before materializing
+        # the Task; this direct lifecycle test must model that claim.
+        await self.store.update_delegation_work_item(
+            report_card.work_item_id,
+            phase=Phase.RUNNING,
+        )
+        report_task = Task(
+            id="cto-report-task",
+            title=report_card.title,
+            project_id="proj1",
+            assigned_to="cto",
+            status=TaskStatus.DONE,
+            metadata={
+                **dict(report_card.metadata or {}),
+                "execution_mode": "company_mode",
+                "delegation_run_id": "run-1",
+                "delegation_seat_id": "seat::team::ceo::cto",
+                "manager_role_id": "ceo",
+                "manager_seat_id": "seat::team::ceo::ceo",
+            },
+        )
+        set_linked_work_item_id(report_task, report_card.work_item_id)
+        await self.executor._apply_done_transition(
+            report_task,
+            result=TaskResult(status=TaskStatus.DONE, content="Structured handoff report."),
+        )
+
+        review_cards = await self._aux_cards_targeting("cto-dispatch-item", "review_target_work_item_id")
+        self.assertEqual(len(review_cards), 1)
+        self.assertNotIn(review_cards[0].phase, DONE_PHASES)
+        self.assertEqual(str(review_cards[0].role_id or ""), "ceo")
+        review_dispatch_evidence = dict(
+            dict((review_cards[0].metadata or {}).get("review_evidence", {}) or {}).get(
+                "manager_dispatch", {}
+            )
+            or {}
+        )
+        self.assertEqual(review_dispatch_evidence.get("source"), "justified")
+
+    async def test_historical_business_child_does_not_exempt_current_self_output(self) -> None:
+        # A child created by a previous attempt is durable board state, not
+        # proof that this completion delegated its output. The current direct
+        # work product still needs the manager review chain.
+        task = await self._make_cto_dispatch_task(
+            metadata_extra={
+                "manager_no_delegation_justification": "This new request is a direct architecture decision."
+            }
+        )
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id="cto-historical-child",
+                run_id="run-1",
+                cell_id="team::ceo",
+                team_instance_id="team-instance::run-1::team::ceo",
+                team_id="team::ceo",
+                role_id="cto",
+                seat_id="seat::team::ceo::cto",
+                seat_state_id="seat-state::run-1::seat::team::ceo::cto",
+                role_runtime_session_id="role-runtime::run-1::seat::team::ceo::cto",
+                parent_work_item_id="cto-dispatch-item",
+                title="Historical delegated child",
+                summary="Completed in a previous attempt.",
+                kind="execute",
+                projection_id="cto-historical-child",
+                phase=Phase.APPROVED,
+                manager_role_id="cto",
+                manager_seat_id="seat::team::ceo::cto",
+                metadata={"work_item_runtime": True, "runtime_model": "multi_team_org"},
+            )
+        )
+
+        phase = await self.executor._apply_done_transition(
+            task,
+            result=TaskResult(
+                status=TaskStatus.DONE,
+                content="Made the new architecture decision directly.",
+            ),
+        )
+
+        self.assertEqual(phase, Phase.AWAITING_MANAGER_REVIEW)
+        work_item = await self.store.get_delegation_work_item("cto-dispatch-item")
+        report_cards = await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")
+        self.assertEqual(len(report_cards), 1)
+        dispatch_evidence = dict(
+            dict((work_item.metadata or {}).get("review_evidence", {}) or {}).get(
+                "manager_dispatch", {}
+            )
+            or {}
+        )
+        self.assertEqual(dispatch_evidence.get("outcome"), "self_produced")
+
+    async def test_attention_aux_does_not_exempt_current_self_output(self) -> None:
+        task = await self._make_cto_dispatch_task(
+            metadata_extra={
+                "manager_no_delegation_justification": "This request requires a direct architecture decision."
+            }
+        )
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id="cto-attention-item",
+                run_id="run-1",
+                parent_work_item_id="cto-dispatch-item",
+                role_id="cto",
+                seat_id="seat::team::ceo::cto",
+                title="CTO attention",
+                summary="Runtime wake-up wrapper, not delegated business work.",
+                kind="monitor",
+                projection_id="cto-attention-item",
+                phase=Phase.APPROVED,
+                metadata={
+                    "work_item_runtime": True,
+                    "runtime_model": "multi_team_org",
+                    "attention_work_item": True,
+                },
+            )
+        )
+
+        phase = await self.executor._apply_done_transition(
+            task,
+            result=TaskResult(
+                status=TaskStatus.DONE,
+                content="Made the architecture decision directly.",
+            ),
+        )
+
+        self.assertEqual(phase, Phase.AWAITING_MANAGER_REVIEW)
+        work_item = await self.store.get_delegation_work_item("cto-dispatch-item")
+        self.assertEqual(work_item.phase, Phase.AWAITING_MANAGER_REVIEW)
+        self.assertEqual(
+            len(await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")),
+            1,
+        )
+
+    async def test_current_turn_business_board_mutation_keeps_dispatch_auto_approve(self) -> None:
+        task = await self._make_cto_dispatch_task(
+            metadata_extra={"manager_board_mutation_performed": True}
+        )
+
+        phase = await self.executor._apply_done_transition(
+            task, result=TaskResult(status=TaskStatus.DONE, content="Delegated to the team."),
+        )
+
+        self.assertEqual(phase, Phase.APPROVED)
+        work_item = await self.store.get_delegation_work_item("cto-dispatch-item")
+        self.assertEqual(work_item.phase, Phase.APPROVED)
+        self.assertNotIn("turn_output_kind", work_item.metadata or {})
+        self.assertNotIn("turn_output_source", work_item.metadata or {})
+        report_cards = await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")
+        self.assertEqual(report_cards, [])
+
+    async def test_self_produced_intake_routes_to_manager_review(self) -> None:
+        # The delegation-output rule covers every review-exempt delegation
+        # kind, not just dispatch — an intake turn that answered the work
+        # itself needs review too.
+        task = await self._make_cto_dispatch_task(metadata_extra={"work_kind": "intake"})
+
+        phase = await self.executor._apply_done_transition(
+            task, result=TaskResult(status=TaskStatus.DONE, content="Handled the intake question directly."),
+        )
+
+        self.assertEqual(phase, Phase.AWAITING_MANAGER_REVIEW)
+        work_item = await self.store.get_delegation_work_item("cto-dispatch-item")
+        self.assertEqual(work_item.phase, Phase.AWAITING_MANAGER_REVIEW)
+        self.assertNotIn("turn_output_kind", work_item.metadata or {})
+        self.assertNotIn("turn_output_source", work_item.metadata or {})
+
+    async def test_top_seat_self_produced_falls_back_to_auto_approve(self) -> None:
+        # The CEO has no manager to review: the existing no-reviewer
+        # fallback auto-approves instead of stranding the card.
+        self.task.status = TaskStatus.DONE
+        self.task.metadata["work_kind"] = "intake"
+        self.task.metadata["manager_dispatch_guard_unresolved"] = "no children"
+        await self.store.update_delegation_work_item("ceo-work-item", phase=Phase.RUNNING)
+
+        phase = await self.executor._apply_done_transition(
+            self.task, result=TaskResult(status=TaskStatus.DONE, content="Handled at the top."),
+        )
+
+        self.assertEqual(phase, Phase.APPROVED)
+        work_item = await self.store.get_delegation_work_item("ceo-work-item")
+        self.assertEqual(work_item.phase, Phase.APPROVED)
+        self.assertEqual(
+            await self._aux_cards_targeting("ceo-work-item", "report_target_work_item_id"),
+            [],
+        )
+        self.assertEqual(
+            await self._aux_cards_targeting("ceo-work-item", "review_target_work_item_id"),
+            [],
+        )
+
+    async def test_reconcile_rebuilds_missing_report_card(self) -> None:
+        # Current-state crash shape: phase was durably written but the process
+        # stopped before its report card was saved. Phase alone is the
+        # authoritative recovery fact; no output-kind marker is required.
+        await self._make_cto_dispatch_task()
+        await self.store.update_delegation_work_item(
+            "cto-dispatch-item",
+            phase=Phase.AWAITING_MANAGER_REVIEW,
+        )
+        run_items = await self.store.list_delegation_work_items("run-1")
+
+        run_items = await self.executor._reconcile_missing_review_chain(run_items)
+
+        report_cards = await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")
+        self.assertEqual(len(report_cards), 1)
+        # Idempotent: a second pass with the live report card present must
+        # not spawn another attempt.
+        run_items = await self.executor._reconcile_missing_review_chain(run_items)
+        report_cards = await self._aux_cards_targeting("cto-dispatch-item", "report_target_work_item_id")
+        self.assertEqual(len(report_cards), 1)
 
 
 class CompanyModeParallelIsolationTests(unittest.IsolatedAsyncioTestCase):

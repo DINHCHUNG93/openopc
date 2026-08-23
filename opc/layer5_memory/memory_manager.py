@@ -65,6 +65,33 @@ class MemoryManager:
     def set_history_compactor(self, compactor: Any | None) -> None:
         self.history_compactor = compactor
 
+    async def maybe_compact_session_history(
+        self,
+        session_id: str,
+        project_id: str | None = None,
+    ) -> bool:
+        """Threshold-gated session-transcript compaction.
+
+        Chat-style callers invoke this before building prompt context so a
+        long transcript is folded into a summary snapshot instead of growing
+        without bound. Best-effort: failures never block prompt building.
+        """
+        compactor = self.history_compactor
+        maybe_compact = getattr(compactor, "maybe_compact_session", None) if compactor else None
+        if not callable(maybe_compact) or not session_id:
+            return False
+        try:
+            return bool(
+                await maybe_compact(
+                    project_id=self._resolve_project_id(project_id),
+                    session_id=session_id,
+                    force=False,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"Session history compaction skipped: {exc}")
+            return False
+
     def _resolve_project_id(self, project_id: str | None = None) -> str:
         return str(project_id or self.project_id or "default")
 
@@ -713,6 +740,9 @@ class MemoryManager:
         task: Any,
         result_content: str,
         artifacts: dict[str, Any] | None = None,
+        result_delivery_id: str = "",
+        source_result_message_id: str = "",
+        canonical_turn_id: str = "",
     ) -> None:
         if not self.store:
             return
@@ -728,9 +758,13 @@ class MemoryManager:
             metadata={
                 "kind": "child_result",
                 "child_session_id": child_session_id,
+                "source_task_id": str(getattr(task, "id", "") or ""),
                 "task_title": getattr(task, "title", ""),
                 "employee_id": str(assignment.get("employee_id", "")).strip(),
                 "role_id": str(assignment.get("role_id") or getattr(task, "assigned_to", "") or "").strip(),
+                **({"result_delivery_id": str(result_delivery_id).strip()} if str(result_delivery_id).strip() else {}),
+                **({"source_result_message_id": str(source_result_message_id).strip()} if str(source_result_message_id).strip() else {}),
+                **({"canonical_turn_id": str(canonical_turn_id).strip()} if str(canonical_turn_id).strip() else {}),
                 **work_item_identity_payload_for_task(task),
             },
         )
@@ -747,6 +781,8 @@ class MemoryManager:
                 "agent_id": getattr(task, "assigned_to", ""),
                 "summary": summary,
                 "artifacts": self._compact_artifacts(artifacts or {}),
+                **({"result_delivery_id": str(result_delivery_id).strip()} if str(result_delivery_id).strip() else {}),
+                **({"source_result_message_id": str(source_result_message_id).strip()} if str(source_result_message_id).strip() else {}),
             },
         )
 

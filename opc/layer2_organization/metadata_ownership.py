@@ -131,6 +131,10 @@ _WORK_ITEM_FIELDS: tuple[MetadataFieldSpec, ...] = (
     _spec("review_attempt", MetadataOwner.WORK_ITEM, allowed_locations=("work_item", "task_execution_copy"), legacy_fallback=True, migration_policy="work_item_wins"),
     _spec("review_attempt_count", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), legacy_fallback=True, migration_policy="work_item_wins"),
     _spec("review_target_work_item_id", MetadataOwner.WORK_ITEM, allowed_locations=("work_item", "task_execution_copy"), legacy_fallback=True, migration_policy="work_item_wins"),
+    _spec("review_source_report_work_item_id", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("review_resolution", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("review_resolution_state", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("review_resolution_applied_work_item_id", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
     _spec("review_target_worker_task_id", MetadataOwner.WORK_ITEM, allowed_locations=("work_item", "task_execution_copy"), legacy_fallback=True, migration_policy="work_item_wins"),
     _spec("review_target_worker_role_id", MetadataOwner.WORK_ITEM, allowed_locations=("work_item", "task_execution_copy"), legacy_fallback=True, migration_policy="work_item_wins"),
     _spec("review_target_worker_seat_id", MetadataOwner.WORK_ITEM, allowed_locations=("work_item", "task_execution_copy"), legacy_fallback=True, migration_policy="work_item_wins"),
@@ -183,6 +187,17 @@ _WORK_ITEM_FIELDS: tuple[MetadataFieldSpec, ...] = (
     _spec("self_evolution_patch", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
     _spec("self_evolution_completed_at", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
     _spec("self_evolution_error", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    # Attempt ledger (dispatch-attempt accounting; see phase.py). Opened by the
+    # claim CAS, settled by transition_work_item — the dispatcher's structural
+    # brake against crash/interrupted re-dispatch loops.
+    _spec("attempt_seq", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_settled", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_outcome", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_started_at", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_settled_at", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_crash_streak", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_interrupted_streak", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
+    _spec("attempt_ledger_block_reason", MetadataOwner.WORK_ITEM, allowed_locations=("work_item",), migration_policy="work_item_wins"),
 )
 
 _RUNTIME_TASK_FIELDS: tuple[MetadataFieldSpec, ...] = (
@@ -370,6 +385,33 @@ def build_work_item_owner_execution_copy(work_item: DelegationWorkItem | None) -
         for key, value in payload.items()
         if key in EXECUTION_COPY_KEYS and _has_value(value)
     }
+
+
+def build_company_resume_identity_restore(
+    *,
+    role_id: str,
+    seat_id: str,
+    role_runtime_session_id: str,
+) -> dict[str, Any]:
+    """Map checkpoint-validated resume identity onto Task execution-copy keys.
+
+    Company resume restores missing Task projection fields from the durable
+    checkpoint after the authoritative WorkItem has been cross-checked (the
+    checkpoint may hold values the WorkItem row lacks, so this is not always
+    derivable via ``build_work_item_owner_execution_copy``). The key spelling
+    lives here, next to the owner spec, so runtime code never hand-writes
+    WorkItem-owned execution-copy keys.
+    """
+    payload: dict[str, Any] = {
+        "work_item_role_id": str(role_id or "").strip(),
+    }
+    seat = str(seat_id or "").strip()
+    if seat:
+        payload["delegation_seat_id"] = seat
+    session = str(role_runtime_session_id or "").strip()
+    if session:
+        payload["delegation_role_session_id"] = session
+    return payload
 
 
 def strip_disallowed_work_item_metadata_from_runtime_task(task: Task) -> list[str]:

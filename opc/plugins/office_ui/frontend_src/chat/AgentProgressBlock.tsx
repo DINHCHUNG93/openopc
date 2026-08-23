@@ -18,6 +18,7 @@ export const INLINE_PROGRESS_ENTRY_TYPES = new Set<ProgressEntryType>(['thinking
 
 const ENTRY_CONFIG: Record<ProgressEntryType, { icon: React.ReactNode; color: string; label: string }> = {
   thinking:      { icon: <IconBrain />,       color: 'var(--accent)',          label: 'Thinking' },
+  assistant:     { icon: <IconSparkle />,     color: 'var(--accent)',          label: 'Reply' },
   tool_call:     { icon: <IconTool />,        color: 'var(--green)',           label: 'Tool' },
   autonomy:      { icon: <IconShield />,      color: 'var(--yellow)',          label: 'Autonomy' },
   handoff:       { icon: <IconArrowRight />,  color: 'var(--accent)',          label: 'Handoff' },
@@ -155,7 +156,7 @@ export function AgentProgressBlock({ entries, agentStatus, currentTool, toolElap
             const cfg = ENTRY_CONFIG[entry.type] || ENTRY_CONFIG.status_change
 
             return (
-              <div key={progressEntryKey(entry, i)} className={`ptl-entry${isLast ? ' ptl-entry-last' : ''}`}>
+              <div key={progressEntryKey(entry)} className={`ptl-entry${isLast ? ' ptl-entry-last' : ''}`}>
                 <div className="ptl-connector">
                   <div className="ptl-dot" style={{ color: cfg.color }}>
                     {cfg.icon}
@@ -183,11 +184,17 @@ export function AgentProgressBlock({ entries, agentStatus, currentTool, toolElap
         </div>
       )}
 
-      {/* ── Collapse button (when expanded) ────────────── */}
+      {/* ── Expand/collapse toggle (below timeline) ────── */}
       {expanded && filteredEntries.length > COLLAPSED_COUNT && (
         <button className="ptl-expand" onClick={() => setExpanded(false)}>
           <IconChevron down />
           <span>Show less</span>
+        </button>
+      )}
+      {!expanded && hiddenCount > 0 && (
+        <button className="ptl-expand" onClick={() => setExpanded(true)}>
+          <IconChevron />
+          <span>Show more ({hiddenCount} earlier step{hiddenCount > 1 ? 's' : ''})</span>
         </button>
       )}
     </div>
@@ -251,7 +258,7 @@ export const AgentProgressEntryCard = React.memo(function AgentProgressEntryCard
     )
   }
 
-  if (entry.type === 'thinking') {
+  if (entry.type === 'thinking' || entry.type === 'assistant') {
     return (
       <div className="ptl-tool-card">
         <button

@@ -542,8 +542,8 @@ export function WorkItemProgressCard({
     return isCompanyRuntime ? [] : workItemLogWorkItems
   }, [isCompanyRuntime, roleSummaries, workItemLogWorkItems])
 
-  if (isCompanyRuntime && roleSummaries.length === 0) return null
-  if (workItemLog.length === 0 && workItems.length === 0 && roleSummaries.length === 0) return null
+  const isPreparingCompanyRuntime = isCompanyRuntime && roleSummaries.length === 0
+  if (!isCompanyRuntime && workItemLog.length === 0 && workItems.length === 0 && roleSummaries.length === 0) return null
 
   return (
     <div className="wi-progress-card">
@@ -568,6 +568,12 @@ export function WorkItemProgressCard({
               {i < workItems.length - 1 && <span className="wi-projection-connector">&rarr;</span>}
             </div>
           ))}
+        </div>
+      )}
+
+      {isPreparingCompanyRuntime && (
+        <div className="wi-progress-pipeline wi-progress-pipeline-empty" role="status">
+          Preparing company roles…
         </div>
       )}
 

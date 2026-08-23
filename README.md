@@ -25,6 +25,10 @@ Các tính năng nổi bật của OpenOPC:
 
 <h1 align="center" style="font-size: 1.75em;">OpenOPC: Build Your Personal AI-Native Company — Self-Built, Self-Run, Self-Grown</h1>
 
+<p align="center">
+  <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 🏗️ **Self-Built** — Fully automated to recruit role-specific AI employees and build the org.
 
 ⚙️ **Self-Run** — Fully automated to assign tasks, drive handoffs, and keep moving toward your goal.
@@ -42,10 +46,16 @@ Các tính năng nổi bật của OpenOPC:
 
 ![OpenOPC hero banner](docs/assets/chat.png)
 
+## News
+
+- **Jul 14, 2026 — More resilient company runs:** Company-mode sessions now recover and resume more seamlessly while preserving agent identity, shared role context, delegation, and review progress.
+- **Jul 13, 2026 — Smoother Office UI:** Faster live updates and chat scrolling improve long-running projects.
+- **Jul 8, 2026 — Smarter approvals:** Session grants persist, low-risk actions flow automatically, and deferred decisions stay available.
+
 ## Table Of Contents
 
-- [Real-World Applications](#real-world-applications)
 - [When To Use OpenOPC](#when-to-use-openopc)
+- [Demos](#demos)
 - [How OpenOPC Works](#how-openopc-works)
 - [Quick Start](#quick-start)
 - [Office UI Guide](#office-ui-guide)
@@ -406,7 +416,7 @@ Company Mode turns one brief into a runtime session plus role-owned work items.
 | `Agents` | Role rollup: active/waiting/pending/done roles, current tool, role work items, filters, search, and links to detailed execution progress. |
 | `Info` | Status, assignees, role identity, employee assignment, selected execution agent, timing, and developer details. |
 | `Comms` | Role inboxes, unread/read/sent messages, meetings, decisions, and recent communication failures. |
-| `Team` | Runtime cockpit: teams, seats, approvals, unread communication, recovery state, and stop controls for the current run. |
+| `Team` | Runtime cockpit: teams, seats, approvals, unread communication, run state, and stop controls for the current run. |
 
 To inspect the detailed workflow for a role, open a company-mode session and click a role/work item in the `Chat` progress card or `Agents` tab. The Execution Progress panel shows each work item, its status, activity sections, tool progress, handoffs, review targets, and execution turn metadata.
 
@@ -543,7 +553,6 @@ See [`docs/cli-chat-slash.md`](docs/cli-chat-slash.md) for the full command tabl
 | `opc talent` | `list`, `employees`, `import`, `hire`, `scan`, `import-selected`, `employee-detail`, `import-agent` |
 | `opc market` | `presets`, `browse`, `preview`, `apply-preset`, `export`, `install`, `list`, `uninstall --yes` |
 | `opc runtime` | `status`, `checkpoints`, `logs`, `run` |
-| `opc recovery` | `scan`, `resume`, `cancel --yes`, `retry` |
 | `opc channels` | `status`, `login`, `start`, `stop` |
 
 Most service-style commands accept `--project/-p` and `--json`.

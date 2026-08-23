@@ -121,10 +121,11 @@ _TASK_MODE_ORCHESTRATION = """
   work or context isolation when that improves the result.
 """
 
+# file_write / file_edit are deliberately NOT blocked: coordination turns
+# produce in-context content (briefs, matrices, review notes) that must be
+# persistable to the workspace, or it gets trapped in blocking DM hand-offs.
 _MULTI_TEAM_COORDINATION_NATIVE_TOOL_BLOCKLIST = {
     "shell_exec",
-    "file_write",
-    "file_edit",
     "apply_patch",
     "python_exec",
     "web_search",
@@ -284,6 +285,7 @@ class NativeAgent:
         config: OPCConfig | None = None,
         communication: Any | None = None,
         approval_callback: Any = None,
+        permission_policy: Any = None,
     ) -> None:
         self.role = role
         self.llm = llm
@@ -297,6 +299,7 @@ class NativeAgent:
         self.config = config or OPCConfig()
         self.communication = communication
         self.approval_callback = approval_callback
+        self.permission_policy = permission_policy
         self.prompt_profiles = PromptProfileManager(role, self.config)
         max_iter = self.config.system.max_agent_iterations
         comp_threshold = self.config.system.context_compression_threshold
@@ -312,6 +315,7 @@ class NativeAgent:
             config=self.config,
             child_agent_factory=self._create_child_agent,
             approval_callback=approval_callback,
+            permission_policy=permission_policy,
             prefetch_provider=self._build_runtime_prefetch_payload,
         )
 
@@ -741,4 +745,5 @@ class NativeAgent:
             config=child_config,
             communication=self.communication,
             approval_callback=self.approval_callback,
+            permission_policy=self.permission_policy,
         )

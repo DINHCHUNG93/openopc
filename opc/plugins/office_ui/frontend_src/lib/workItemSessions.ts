@@ -2,31 +2,50 @@ import type { ChatMessage } from '../types/chat'
 import type { ProgressEntry, Session } from '../types/kanban'
 import { getContextUsageMetrics } from './contextUsage'
 import { isSessionWorking } from './sessionRuntime'
+import { stableMessageTimelineKey, stableResultDeliveryKey } from './messageTimelineIdentity'
 
 const CONTEXT_TOKENS_RE = /(\d[\d,]*)\s*\/\s*(\d[\d,]*)\s+tokens/i
 const USED_PCT_RE = /(\d{1,3})%\s*used/i
 const REMAINING_PCT_RE = /(\d{1,3})%\s*remaining/i
 
+export function isMessageVisibleAtDetailLevel(
+  message: ChatMessage,
+  detailLevel: 'summary' | 'full',
+): boolean {
+  if (detailLevel === 'full') return true
+  return String(message.metadata?.detail_visibility ?? 'summary').trim() !== 'full'
+}
+
 function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim()
 }
 
-function stripNarrativeTitlePrefix(content: string): string {
-  const trimmed = String(content || '').trim()
-  const markdownTitle = trimmed.match(/^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$/)
-  if (markdownTitle) {
-    const body = markdownTitle[2].trim()
-    if (body.length >= 80) return body
-  }
-  const colonIndex = trimmed.indexOf(': ')
-  if (colonIndex < 8 || colonIndex > 160) return trimmed
+function normalizeResultContentFallback(content: string): string {
+  let normalized = String(content || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 
-  const prefix = trimmed.slice(0, colonIndex).replace(/\*/g, '').trim()
-  const body = trimmed.slice(colonIndex + 2).trim()
-  if (body.length < 80) return trimmed
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(prefix)) return trimmed
-  if (/^(https?|file)$/i.test(prefix)) return trimmed
-  return body
+  // Some result mirrors add one explicit Markdown narrative label. Only
+  // remove that anchored wrapper; a colon later in Markdown (for example
+  // "**Work Item 1: ..." or "- ID: ...") is message content, not a title.
+  for (;;) {
+    const markdownTitle = normalized.match(/^\*\*([^\r\n]{8,160}?)\*\*:(?:[ \t]+|\r?\n+)([\s\S]+)$/)
+    if (!markdownTitle) break
+    const body = markdownTitle[2].trim()
+    if (body.length < 80 || body === normalized) break
+    normalized = body
+  }
+
+  const paragraphs = normalized.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
+  if (paragraphs.length > 1 && /^Verification:\s/i.test(paragraphs[paragraphs.length - 1])) {
+    normalized = paragraphs.slice(0, -1).join('\n\n').trim()
+  }
+  return compactWhitespace(normalized).slice(0, 2000)
 }
 
 function resultSurfacePriority(message: ChatMessage): number {
@@ -58,9 +77,52 @@ function resultSurfacePriority(message: ChatMessage): number {
   return 0
 }
 
-function resultSurfaceDedupeKey(message: ChatMessage): string {
+function normalizedResultContentLength(message: ChatMessage): number {
+  return String(message.content ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .join('\n')
+    .trim()
+    .length
+}
+
+function resultAuthorityScore(message: ChatMessage): number {
+  const metadata = (message.metadata ?? {}) as Record<string, unknown>
+  let score = 0
+  if (String(metadata.source ?? '').trim() === 'engine') score += 4
+  if (String(metadata.source_result_message_id ?? '').trim()) score += 2
+  if (metadata.authoritative_output === true || metadata.canonical_result === true) score += 1
+  return score
+}
+
+function compareResultSurfacePreference(left: ChatMessage, right: ChatMessage): number {
+  const numericComparisons: Array<[number, number]> = [
+    [resultSurfacePriority(left), resultSurfacePriority(right)],
+    [resultAuthorityScore(left), resultAuthorityScore(right)],
+    [normalizedResultContentLength(left), normalizedResultContentLength(right)],
+  ]
+  for (const [leftValue, rightValue] of numericComparisons) {
+    if (leftValue !== rightValue) return leftValue > rightValue ? 1 : -1
+  }
+  const idComparison = left.id.localeCompare(right.id)
+  if (idComparison !== 0) return idComparison
+  const contentComparison = left.content.localeCompare(right.content)
+  if (contentComparison !== 0) return contentComparison
+  // Result chronology is later rewritten to the earliest underlying delivery.
+  // Timestamp is therefore safe only after immutable identity/content have
+  // tied; it must never be able to flip the selected surface on replay.
+  if (left.timestamp === right.timestamp) return 0
+  return left.timestamp > right.timestamp ? 1 : -1
+}
+
+export function resultSurfaceDedupeKey(message: ChatMessage): string {
   if (resultSurfacePriority(message) <= 0) return ''
-  const content = compactWhitespace(stripNarrativeTitlePrefix(message.content)).slice(0, 2000)
+  const deliveryKey = stableResultDeliveryKey(message)
+  if (deliveryKey) return `result:${deliveryKey}`
+
+  const content = normalizeResultContentFallback(message.content)
   return content ? `result:${content}` : ''
 }
 
@@ -378,7 +440,6 @@ export function getConversationSessionView(
     runtimeControlState: runtimeSource.runtimeControlState ?? normalizedActiveSession.runtimeControlState,
     canStop: runtimeSource.canStop ?? normalizedActiveSession.canStop,
     canResume: runtimeSource.canResume ?? normalizedActiveSession.canResume,
-    resumeParentTaskId: runtimeSource.resumeParentTaskId ?? normalizedActiveSession.resumeParentTaskId,
     resumeParentSessionId: runtimeSource.resumeParentSessionId ?? normalizedActiveSession.resumeParentSessionId,
     pendingRuntimeCheckpointId: runtimeSource.pendingRuntimeCheckpointId ?? normalizedActiveSession.pendingRuntimeCheckpointId,
     stopIntentId: runtimeSource.stopIntentId ?? normalizedActiveSession.stopIntentId,
@@ -438,7 +499,6 @@ export function getConversationHeaderSession(
     runtimeControlState: runtimeSource.runtimeControlState ?? normalizedActiveSession.runtimeControlState,
     canStop: runtimeSource.canStop ?? normalizedActiveSession.canStop,
     canResume: runtimeSource.canResume ?? normalizedActiveSession.canResume,
-    resumeParentTaskId: runtimeSource.resumeParentTaskId ?? normalizedActiveSession.resumeParentTaskId,
     resumeParentSessionId: runtimeSource.resumeParentSessionId ?? normalizedActiveSession.resumeParentSessionId,
     pendingRuntimeCheckpointId: runtimeSource.pendingRuntimeCheckpointId ?? normalizedActiveSession.pendingRuntimeCheckpointId,
     stopIntentId: runtimeSource.stopIntentId ?? normalizedActiveSession.stopIntentId,
@@ -454,10 +514,29 @@ export function getConversationHeaderSession(
 export function mergeConversationMessages(messageGroups: ChatMessage[][]): ChatMessage[] {
   const seen = new Set<string>()
   const resultKeyIndex = new Map<string, number>()
+  const checkpointIndex = new Map<string, number>()
   const merged: ChatMessage[] = []
   for (const group of messageGroups) {
     for (const message of group) {
       const metadata = (message.metadata ?? {}) as Record<string, unknown>
+      const checkpointId = String(metadata.checkpoint_id ?? '').trim()
+      if (checkpointId) {
+        const existingIndex = checkpointIndex.get(checkpointId)
+        if (existingIndex !== undefined) {
+          const existing = merged[existingIndex]
+          const latest = message.timestamp >= existing.timestamp ? message : existing
+          const earliest = message.timestamp < existing.timestamp ? message : existing
+          merged[existingIndex] = {
+            ...existing,
+            ...latest,
+            id: existing.id,
+            channelId: existing.channelId,
+            timestamp: earliest.timestamp,
+            metadata: { ...(existing.metadata ?? {}), ...(latest.metadata ?? {}) },
+          }
+          continue
+        }
+      }
       const uiMessageId = typeof metadata.ui_message_id === 'string'
         ? metadata.ui_message_id.trim()
         : ''
@@ -465,16 +544,32 @@ export function mergeConversationMessages(messageGroups: ChatMessage[][]): ChatM
       if (resultKey) {
         const existingIndex = resultKeyIndex.get(resultKey)
         if (existingIndex !== undefined) {
-          if (resultSurfacePriority(message) > resultSurfacePriority(merged[existingIndex])) {
-            merged[existingIndex] = message
+          const existing = merged[existingIndex]
+          const candidateWins = compareResultSurfacePreference(message, existing) > 0
+          const preferred = candidateWins ? message : existing
+          const secondary = candidateWins ? existing : message
+          merged[existingIndex] = {
+            ...secondary,
+            ...preferred,
+            // A result surface keeps the chronology of the first underlying
+            // delivery, independent of which related channel happened to be
+            // traversed first for this render.
+            timestamp: Math.min(existing.timestamp, message.timestamp),
+            metadata: {
+              ...(secondary.metadata ?? {}),
+              ...(preferred.metadata ?? {}),
+              ui_timeline_id: resultKey || stableMessageTimelineKey(existing),
+            },
           }
           continue
         }
         resultKeyIndex.set(resultKey, merged.length)
       }
-      const dedupeKey = resultKey || uiMessageId || `${message.sender}:${message.replyToId ?? ''}:${message.timestamp}:${message.content.trim()}`
+      const checkpointKey = checkpointId ? `checkpoint:${checkpointId}` : ''
+      const dedupeKey = resultKey || checkpointKey || uiMessageId || `${message.sender}:${message.replyToId ?? ''}:${message.timestamp}:${message.content.trim()}`
       if (seen.has(dedupeKey)) continue
       seen.add(dedupeKey)
+      if (checkpointId) checkpointIndex.set(checkpointId, merged.length)
       merged.push(message)
     }
   }
@@ -483,6 +578,52 @@ export function mergeConversationMessages(messageGroups: ChatMessage[][]): ChatM
       ? a.id.localeCompare(b.id)
       : a.timestamp - b.timestamp
   ))
+}
+
+/**
+ * Build the durable transcript shown by a company/org parent session.
+ *
+ * A parent conversation may observe every related runtime channel so that
+ * canonical role deliveries can be surfaced in one place.  Those channels
+ * also contain transient child turns, however, and rendering all of them in
+ * the parent transcript makes the visible timeline change whenever the
+ * runtime projection selects a different child.  Keep the parent's committed
+ * messages and only admit the canonical cross-channel result surfaces.
+ */
+export function selectCompanySummaryMessages(
+  messages: ChatMessage[],
+  parentChannelId: string,
+): ChatMessage[] {
+  const durableMessages: ChatMessage[] = []
+  for (const message of messages) {
+    if (message.channelId === parentChannelId) {
+      if (isMessageVisibleAtDetailLevel(message, 'summary')) {
+        durableMessages.push(message)
+      }
+      continue
+    }
+    const metadata = (message.metadata ?? {}) as Record<string, unknown>
+    const kind = String(metadata.transcript_kind ?? metadata.kind ?? '').trim()
+    const checkpointId = String(metadata.checkpoint_id ?? '').trim()
+    const checkpointType = String(metadata.checkpoint_type ?? '').trim()
+    const checkpointResponseId = String(metadata.response_to_checkpoint_id ?? '').trim()
+    const escalationResponseId = String(metadata.response_to_escalation_id ?? '').trim()
+    if ((checkpointId && checkpointType) || checkpointResponseId || escalationResponseId) {
+      durableMessages.push(message)
+      continue
+    }
+    if ([
+      'company_role_result',
+      'company_role_result_retry',
+      'child_task_result',
+      'child_task_result_retry',
+      'child_result',
+      'top_level_reply',
+    ].includes(kind)) {
+      durableMessages.push(message)
+    }
+  }
+  return mergeConversationMessages([durableMessages])
 }
 
 export function mergeConversationProgressLog(timelineSessions: Session[]): ProgressEntry[] {

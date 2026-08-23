@@ -77,7 +77,6 @@ interface ContextPanelProps {
   onCommsRefresh?: () => void
   onCommsReadMessage?: (path: string) => void
   orgInfoData?: OrgInfoPayload | null
-  recoveryStatus?: Record<string, unknown> | null
   canShowTeamTab?: boolean
   onTeamStopRun?: () => void
 
@@ -191,6 +190,45 @@ function hasCompanyRuntimeIdentity(session: Session): boolean {
     || session.roleWorkItems
     || session.executorRoleWorkItems
   )
+}
+
+function isCompanyRuntimeSession(
+  session: Session | null | undefined,
+  relatedSessionCount = 0,
+): boolean {
+  if (!session) return false
+  const mode = String(session.execMode ?? '').trim().toLowerCase()
+  return relatedSessionCount > 0
+    || hasCompanyRuntimeIdentity(session)
+    || mode === 'company'
+    || mode === 'org'
+    || mode === 'custom'
+}
+
+export function sessionHasMoreForDetail(
+  session: Session,
+  detailLevel: 'summary' | 'full',
+): boolean | undefined {
+  const scoped = detailLevel === 'full' ? session.fullHasMore : session.summaryHasMore
+  if (scoped !== undefined) return scoped
+  // Old snapshots only expose the unscoped value. Once either scoped cursor
+  // has been observed, the generic field may describe the other policy.
+  if (session.summaryHasMore === undefined && session.fullHasMore === undefined) {
+    return session.hasMore
+  }
+  return undefined
+}
+
+export function conversationHasOlderHistory(
+  sessions: Session[],
+  displayedMessageCount: number,
+  detailLevel: 'summary' | 'full',
+  allowMessageCountFallback = true,
+): boolean {
+  const pagination = sessions.map(session => sessionHasMoreForDetail(session, detailLevel))
+  if (pagination.some(hasMore => hasMore === true)) return true
+  if (sessions.length !== 1 || pagination[0] === false) return false
+  return allowMessageCountFallback && sessions[0].messageCount > displayedMessageCount
 }
 
 function hasCustomRuntimeIdentity(session: Session): boolean {
@@ -458,7 +496,6 @@ export function ContextPanel({
   onCommsRefresh,
   onCommsReadMessage,
   orgInfoData,
-  recoveryStatus,
   canShowTeamTab = false,
   onTeamStopRun,
   onTitleChange,
@@ -498,7 +535,7 @@ export function ContextPanel({
   const isChildDetail = activeView.kind === 'child-detail'
   const isTaskDetail = activeView.kind === 'task-detail'
 
-  const isCompanyRuntime = !!(activeSession && (activeSession.isCompanyRuntime || childSessions.length > 0))
+  const isCompanyRuntime = isCompanyRuntimeSession(activeSession, childSessions.length)
   const showTabs = activeView.kind === 'session' && activeSession
   const canSend = isSecretary ? true : !!activeSession
   const showSessionStrip = !isChildDetail && openSessions.length > 0
@@ -553,10 +590,14 @@ export function ContextPanel({
       const matched = activeConversation.timelineSessions.find(
         (session) => session.channelId === oldestMessage.channelId,
       )
-      if (matched) return matched
+      if (matched && sessionHasMoreForDetail(matched, activeDetailMode) !== false) return matched
     }
+    const knownTarget = activeConversation.timelineSessions.find(
+      session => sessionHasMoreForDetail(session, activeDetailMode) === true,
+    )
+    if (knownTarget) return knownTarget
     return activeDisplaySession ?? activeSession
-  }, [activeConversation.timelineSessions, activeDisplaySession, activeSession])
+  }, [activeConversation.timelineSessions, activeDetailMode, activeDisplaySession, activeSession])
 
   // Child detail: find the agent for this session
   const childDetailAgent = useMemo(() => {
@@ -706,24 +747,20 @@ export function ContextPanel({
                 draftTurnId={childDetailSession.draftTurnId}
                 onMarkRead={onMarkRead}
                 hasOlderHistory={
-                  // The `messageCount > loaded.length` race flashes the
-                  // "Load older messages" hint every ~1s while the agent
-                  // streams: backend bumps count, new message arrives
-                  // at chatStore 1 tick later, hint appears then hides.
-                  // The insertion/removal of the hint row also triggers
-                  // auto-scroll, which pushes the user's own input off
-                  // the top of the viewport. Suppress the hint while the
-                  // session is actively working — any transient delta
-                  // during active turns is almost always in-flight new
-                  // messages, not an older-history gap.
-                  !isSessionWorking(childDetailSession)
-                  && childDetailSession.messageCount > childDetailMessages.length
+                  // A scoped backend cursor remains actionable during live
+                  // work. Only the racy messageCount fallback is suppressed.
+                  conversationHasOlderHistory(
+                    [childDetailSession],
+                    childDetailMessages.length,
+                    'full',
+                    !isSessionWorking(childDetailSession),
+                  )
                 }
                 totalMessageCount={childDetailSession.messageCount}
                 onLoadOlderHistory={(oldestMessage) => onLoadSessionHistory?.(childDetailSession.taskId, oldestMessage, 'full')}
                 loadingOlderHistory={isSessionHistoryLoading?.(childDetailSession.taskId) ?? false}
-                autoScroll={false}
-                initialScrollToBottom
+                scrollPolicy="initial-bottom"
+                scrollScope={childDetailSession.channelId}
                 showRuntimeProgress
                 renderUserMarkdown
               />
@@ -911,7 +948,7 @@ export function ContextPanel({
                       .map(id => agents.find(agent => agent.agent_id === id)?.name ?? id)
                       .filter(Boolean)
                     const runtimeLabel = sessionRuntimeLabel(sessionConversationSession ?? session, activeChildCount)
-                    const sessionIsCompanyRuntime = !!(session.isCompanyRuntime || sessionChildren.length > 0)
+                    const sessionIsCompanyRuntime = isCompanyRuntimeSession(session, sessionChildren.length)
                     const sessionDisplaySession = sessionConversation.displaySession ?? session
                     const sessionProgressLog = mergeConversationProgressLog(sessionConversation.timelineSessions)
                     const sessionMessageCount = getConversationMessageCount(sessionConversation.timelineSessions)
@@ -970,37 +1007,52 @@ export function ContextPanel({
                             channelName={sessionDisplaySession?.title ?? session.title}
                             viewKind="session"
                             detailMode={sessionDetailLevel(sessionDisplaySession)}
-                            agentStatus={sessionConversationSession?.agentStatus ?? sessionDisplaySession?.agentStatus}
-                            currentTool={sessionConversationSession?.currentTool ?? sessionDisplaySession?.currentTool}
-                            toolElapsedMs={sessionConversationSession?.toolElapsedMs ?? sessionDisplaySession?.toolElapsedMs}
-                            lastToolSummary={sessionConversationSession?.lastToolSummary ?? sessionDisplaySession?.lastToolSummary}
-                            progressLog={sessionProgressLog}
-                            draftAssistantText={sessionConversationSession?.draftAssistantText ?? sessionDisplaySession?.draftAssistantText}
-                            draftUpdatedAt={sessionConversationSession?.draftUpdatedAt ?? sessionDisplaySession?.draftUpdatedAt}
-                            draftIteration={sessionConversationSession?.draftIteration ?? sessionDisplaySession?.draftIteration}
-                            draftTurnId={sessionConversationSession?.draftTurnId ?? sessionDisplaySession?.draftTurnId}
-                            isCompanyRuntime={sessionConversationSession?.isCompanyRuntime ?? sessionIsCompanyRuntime}
+                            agentStatus={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.agentStatus ?? sessionDisplaySession?.agentStatus)}
+                            currentTool={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.currentTool ?? sessionDisplaySession?.currentTool)}
+                            toolElapsedMs={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.toolElapsedMs ?? sessionDisplaySession?.toolElapsedMs)}
+                            lastToolSummary={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.lastToolSummary ?? sessionDisplaySession?.lastToolSummary)}
+                            progressLog={sessionIsCompanyRuntime ? undefined : sessionProgressLog}
+                            draftAssistantText={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftAssistantText ?? sessionDisplaySession?.draftAssistantText)}
+                            draftUpdatedAt={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftUpdatedAt ?? sessionDisplaySession?.draftUpdatedAt)}
+                            draftIteration={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftIteration ?? sessionDisplaySession?.draftIteration)}
+                            draftTurnId={sessionIsCompanyRuntime ? undefined : (sessionConversationSession?.draftTurnId ?? sessionDisplaySession?.draftTurnId)}
+                            isCompanyRuntime={sessionIsCompanyRuntime}
                             workItemLog={sessionConversationSession?.workItemLog ?? session.workItemLog}
                             childSessions={sessionWorkItemRoleSessions}
+                            showWorkItemRuntimeCard={!sessionIsCompanyRuntime}
                             onSend={(content, _taskId, metadata) => onSessionSend?.(session.taskId, content, undefined, metadata)}
                             onWorkItemClick={onWorkItemClick}
                             onWorkItemOpenSession={onWorkItemOpenSession}
                             onMarkRead={() => onSessionMarkRead?.(session.taskId)}
+                            scrollScope={session.channelId}
                             hasOlderHistory={
-                              // Suppress during active work — see note
-                              // on the childDetailSession case above.
-                              !sessionConversation.timelineSessions.some(isSessionWorking)
-                              && sessionMessageCount > sessionMessages.length
+                              // Keep known cursors available during live work;
+                              // suppress only the count-based fallback.
+                              conversationHasOlderHistory(
+                                sessionConversation.timelineSessions,
+                                sessionMessages.length,
+                                sessionDetailLevel(sessionDisplaySession ?? session),
+                                !sessionConversation.timelineSessions.some(isSessionWorking),
+                              )
                             }
                             totalMessageCount={sessionMessageCount}
                             onLoadOlderHistory={(oldestMessage) => {
-                              const targetSession = sessionConversation.timelineSessions.find(
+                              const detailLevel = sessionDetailLevel(sessionDisplaySession ?? session)
+                              const matchedSession = sessionConversation.timelineSessions.find(
                                 (timelineSession) => timelineSession.channelId === oldestMessage?.channelId,
+                              )
+                              const targetSession = (
+                                matchedSession
+                                  && sessionHasMoreForDetail(matchedSession, detailLevel) !== false
+                                  ? matchedSession
+                                  : undefined
+                              ) ?? sessionConversation.timelineSessions.find(
+                                timelineSession => sessionHasMoreForDetail(timelineSession, detailLevel) === true,
                               ) ?? sessionDisplaySession ?? session
                               return onLoadSessionHistory?.(
                                 targetSession.taskId,
                                 oldestMessage,
-                                sessionDetailLevel(targetSession, { childDetail: targetSession.mode === 'child' }),
+                                detailLevel,
                               )
                             }}
                             loadingOlderHistory={sessionHistoryLoading}
@@ -1062,6 +1114,7 @@ export function ContextPanel({
                     detailMode="summary"
                     onSend={onMessageSend}
                     onMarkRead={onMarkRead}
+                    scrollScope={channelId}
                   />
                 </>
               )}
@@ -1077,6 +1130,7 @@ export function ContextPanel({
                     detailMode="summary"
                     onSend={onMessageSend}
                     onMarkRead={onMarkRead}
+                    scrollScope={secretaryChannelId}
                   />
                   <MessageComposer
                     disabled={false}
@@ -1099,7 +1153,7 @@ export function ContextPanel({
                     onComplete={(activeHeaderSession ?? activeSession).status !== 'done' && (activeHeaderSession ?? activeSession).status !== 'cancelled' ? onComplete : undefined}
                     onResume={onResume}
                   />
-                  {isCompanyRuntime && (hasRoleWorkItems || activeWorkItemLog.length > 0 || activeWorkItemRoleSessions.length > 0) && (
+                  {isCompanyRuntime && (
                     <div className="ctx-work-item-progress">
                       <WorkItemProgressCard
                         workItemLog={activeWorkItemLog}
@@ -1117,16 +1171,16 @@ export function ContextPanel({
                     channelName={channelName}
                     viewKind="session"
                     detailMode={activeDetailMode}
-                    agentStatus={activeConversationSession?.agentStatus ?? activeDisplaySession?.agentStatus}
-                    currentTool={activeConversationSession?.currentTool ?? activeDisplaySession?.currentTool}
-                    toolElapsedMs={activeConversationSession?.toolElapsedMs ?? activeDisplaySession?.toolElapsedMs}
-                    lastToolSummary={activeConversationSession?.lastToolSummary ?? activeDisplaySession?.lastToolSummary}
-                    progressLog={activeConversationProgress}
-                    draftAssistantText={activeConversationSession?.draftAssistantText ?? activeDisplaySession?.draftAssistantText}
-                    draftUpdatedAt={activeConversationSession?.draftUpdatedAt ?? activeDisplaySession?.draftUpdatedAt}
-                    draftIteration={activeConversationSession?.draftIteration ?? activeDisplaySession?.draftIteration}
-                    draftTurnId={activeConversationSession?.draftTurnId ?? activeDisplaySession?.draftTurnId}
-                    isCompanyRuntime={activeConversationSession?.isCompanyRuntime ?? isCompanyRuntime}
+                    agentStatus={isCompanyRuntime ? undefined : (activeConversationSession?.agentStatus ?? activeDisplaySession?.agentStatus)}
+                    currentTool={isCompanyRuntime ? undefined : (activeConversationSession?.currentTool ?? activeDisplaySession?.currentTool)}
+                    toolElapsedMs={isCompanyRuntime ? undefined : (activeConversationSession?.toolElapsedMs ?? activeDisplaySession?.toolElapsedMs)}
+                    lastToolSummary={isCompanyRuntime ? undefined : (activeConversationSession?.lastToolSummary ?? activeDisplaySession?.lastToolSummary)}
+                    progressLog={isCompanyRuntime ? undefined : activeConversationProgress}
+                    draftAssistantText={isCompanyRuntime ? undefined : (activeConversationSession?.draftAssistantText ?? activeDisplaySession?.draftAssistantText)}
+                    draftUpdatedAt={isCompanyRuntime ? undefined : (activeConversationSession?.draftUpdatedAt ?? activeDisplaySession?.draftUpdatedAt)}
+                    draftIteration={isCompanyRuntime ? undefined : (activeConversationSession?.draftIteration ?? activeDisplaySession?.draftIteration)}
+                    draftTurnId={isCompanyRuntime ? undefined : (activeConversationSession?.draftTurnId ?? activeDisplaySession?.draftTurnId)}
+                    isCompanyRuntime={isCompanyRuntime}
                     workItemLog={activeWorkItemLog}
                     roleWorkItems={activeRoleWorkItems}
                     executorRoleWorkItems={activeExecutorRoleWorkItems}
@@ -1135,11 +1189,16 @@ export function ContextPanel({
                     onWorkItemClick={onWorkItemClick}
                     onWorkItemOpenSession={onWorkItemOpenSession}
                     onMarkRead={onMarkRead}
+                    scrollScope={channelId}
                     hasOlderHistory={
-                      // Suppress during active work — see note on the
-                      // childDetailSession case above.
-                      !activeConversation.timelineSessions.some(isSessionWorking)
-                      && activeConversationMessageCount > messages.length
+                      // Keep known cursors available during live work;
+                      // suppress only the count-based fallback.
+                      conversationHasOlderHistory(
+                        activeConversation.timelineSessions,
+                        messages.length,
+                        activeDetailMode,
+                        !activeConversation.timelineSessions.some(isSessionWorking),
+                      )
                     }
                     totalMessageCount={activeConversationMessageCount}
                     onLoadOlderHistory={(oldestMessage) => {
@@ -1148,7 +1207,7 @@ export function ContextPanel({
                       return onLoadSessionHistory?.(
                         targetSession.taskId,
                         oldestMessage,
-                        sessionDetailLevel(targetSession, { childDetail: targetSession.mode === 'child' }),
+                        activeDetailMode,
                       )
                     }}
                     loadingOlderHistory={activeConversationLoading}
@@ -1245,7 +1304,6 @@ export function ContextPanel({
                 <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
                   <ProjectCockpit
                     orgInfoData={orgInfoData ?? null}
-                    recoveryStatus={recoveryStatus ?? null}
                     commsState={commsState ?? null}
                     onStopRun={onTeamStopRun}
                     embedded

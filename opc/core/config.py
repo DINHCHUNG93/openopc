@@ -273,6 +273,7 @@ class LLMConfig(BaseModel):
     fallback: dict[str, Any] = Field(default_factory=dict)
     temperature: float = 0.3
     max_tokens: int = 32768
+    reasoning_effort: str | None = None
     # Total input context window (tokens) for the active model. Set this when
     # the model is not mapped in litellm (e.g. proxy/self-hosted models like
     # doubao/minimax/glm), so the context-usage ring and compaction thresholds
@@ -585,8 +586,9 @@ class StreamRenderingConfig(BaseModel):
 
 class ContextGuardConfig(BaseModel):
     enabled: bool = True
-    soft_threshold: float = 0.60
-    hard_threshold: float = 0.80
+    # Below this usage ratio the history is never rewritten; at or above it
+    # the runtime folds old messages into one LLM summary (durable compaction).
+    hard_threshold: float = 0.90
     warn_remaining_pct: int = 15
     tool_output_char_budget: int = 12_000
     shell_stdout_char_budget: int = 12_000
@@ -691,21 +693,9 @@ class NativeSubagentProfileConfig(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
 
 
-class ClassifierThresholdsConfig(BaseModel):
-    allow: float = 0.2
-    ask: float = 0.5
-    deny: float = 0.8
-
-
 class DenialMemoryConfig(BaseModel):
     enabled: bool = True
     repeat_threshold: int = 2
-
-
-class SandboxPolicyConfig(BaseModel):
-    treat_network_as_risky: bool = True
-    treat_external_paths_as_high_risk: bool = True
-    explicit_prefix_allowlist: list[str] = Field(default_factory=list)
 
 
 class GuardianConfig(BaseModel):
@@ -717,57 +707,21 @@ class GuardianConfig(BaseModel):
 
 
 class PermissionsV2Config(BaseModel):
+    """Runtime knobs for the unified permission predictor (ApprovalEngine.predict).
+
+    Shell safe-command policy lives in ``autonomy.safe_command_prefixes`` plus
+    the built-in flag-audited classifier (``shell_safety.py``); legacy
+    duplicate fields (safe_shell_prefixes, classifier_*, sandbox_policy, ...)
+    from the removed runtime-side resolver are ignored on load.
+    """
+
     enabled: bool = True
     fail_closed: bool = True
-    classifier_enabled: bool = True
-    shell_ast_validation: bool = True
-    llm_classifier_model: str = ""
-    classifier_thresholds: ClassifierThresholdsConfig = Field(default_factory=ClassifierThresholdsConfig)
     denial_memory: DenialMemoryConfig = Field(default_factory=DenialMemoryConfig)
-    sandbox_policy: SandboxPolicyConfig = Field(default_factory=SandboxPolicyConfig)
-    candidate_extractors: list[str] = Field(default_factory=lambda: [
-        "path",
-        "file_path",
-        "directory",
-        "working_directory",
-        "target_output_dir",
-        "workspace_path",
-        "command",
-        "cmd",
-        "url",
-    ])
-    default_scope: str = "once"
-    allow_scopes: list[str] = Field(default_factory=lambda: ["once", "session", "project", "global"])
     allow_tools: list[str] = Field(default_factory=list)
     deny_tools: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=list)
     denied_paths: list[str] = Field(default_factory=list)
-    safe_shell_prefixes: list[str] = Field(default_factory=lambda: [
-        "ls",
-        "pwd",
-        "echo",
-        "rg",
-        "git status",
-        "git diff",
-        "curl",
-        "wget",
-        "yt-dlp",
-        "aria2c",
-        "ffmpeg",
-        "python -V",
-        "python3 -V",
-        "node -v",
-        "npm -v",
-    ])
-    ask_shell_prefixes: list[str] = Field(default_factory=lambda: [
-        "git commit",
-        "git push",
-        "npm install",
-        "pip install",
-        "pnpm install",
-        "cargo test",
-        "pytest",
-    ])
     guardian: GuardianConfig = Field(default_factory=GuardianConfig)
     dangerous_shell_patterns: list[str] = Field(default_factory=lambda: [
         r"\brm\s+-rf\b",
@@ -994,6 +948,12 @@ class AutonomyConfig(BaseModel):
     safe_command_prefixes: list[str] = Field(default_factory=lambda: [
         "ls", "pwd", "echo", "rg", "find", "git status", "git diff", "python -V",
         "python3 -V", "node -v", "npm -v", "curl", "wget", "yt-dlp", "aria2c", "ffmpeg",
+        # Read-only commands agents chain constantly; each segment of a compound
+        # command must match one of these for the whole command to stay LOW risk.
+        "cd", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "cut", "tr",
+        "stat", "file", "which", "date", "du", "df", "tree", "basename", "dirname",
+        "realpath", "readlink", "uname", "nproc", "whoami", "hostname", "git log",
+        "git show", "git rev-parse",
     ])
     permissions_v2: PermissionsV2Config = Field(default_factory=PermissionsV2Config)
 

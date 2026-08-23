@@ -19,6 +19,7 @@ from opc.core.models import (
     AgentStatus,
     ApprovalAction,
     ApprovalDecision,
+    DelegationRoleSession,
     DelegationWorkItem,
     ExecutionMode,
     Phase,
@@ -32,6 +33,8 @@ from opc.engine import OPCEngine
 from opc.layer1_perception.context_assembler import ContextAssembler, ExternalContextLayers
 from opc.layer2_organization import comms as file_comms
 from opc.layer2_organization.prompt_contract import make_prompt_contract
+from opc.layer2_organization.company_mode import serialize_company_work_item_runtime_plan
+from opc.layer2_organization.org_work_item_planner import CompanyWorkItemRuntimePlan
 from opc.layer2_organization.work_item_links import set_linked_work_item_id
 from opc.layer3_agent.adapters.claude_code import ClaudeCodeAdapter
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
@@ -546,6 +549,357 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             assert session is not None
             self.assertEqual(session.session_id, "ses_1")
             self.assertEqual(session.metadata.get("resume_session_id"), "ses_1")
+            await store.close()
+
+    async def test_live_provider_thread_is_durable_before_stop_checkpoint_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            role_session_id = "role-runtime::run-live::executor"
+            parent_session_id = "company-live-session"
+            await store.save_delegation_role_session(DelegationRoleSession(
+                role_session_id=role_session_id,
+                run_id="run-live",
+                role_id="executor",
+                seat_id="seat-live",
+            ))
+            await store.save_task(Task(
+                id="ui-live",
+                title="Company chat",
+                session_id=parent_session_id,
+                project_id="proj1",
+                status=TaskStatus.IDLE,
+                metadata={"exec_mode": "company", "company_profile": "corporate"},
+            ))
+            work_item = DelegationWorkItem(
+                work_item_id="work-live",
+                run_id="run-live",
+                role_id="executor",
+                seat_id="seat-live",
+                role_runtime_session_id=role_session_id,
+                title="Live work",
+                projection_id="live",
+                phase=Phase.RUNNING,
+                claimed_by_role_runtime_session_id=role_session_id,
+                claimed_by_seat_id="seat-live",
+                metadata={"work_item_projection_id": "live"},
+            )
+            await store.save_delegation_work_item(work_item)
+            plan = CompanyWorkItemRuntimePlan(
+                profile="corporate",
+                metadata={
+                    "execution_model": "multi_team_org",
+                    "runtime_model": "multi_team_org",
+                },
+            )
+            task = Task(
+                id="live-provider-task",
+                title="Live provider task",
+                session_id="live-child-session",
+                parent_session_id=parent_session_id,
+                project_id="proj1",
+                assigned_to="executor",
+                assigned_external_agent="script_agent",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "work_item_runtime": True,
+                    "work_item_projection_id": "live",
+                    "delegation_run_id": "run-live",
+                    "delegation_role_session_id": role_session_id,
+                    "delegation_seat_id": "seat-live",
+                    "selected_execution_agent": "script_agent",
+                    "selected_execution_agent_source": "fallback_rules",
+                    "company_profile": "corporate",
+                    "execution_model": "multi_team_org",
+                    "runtime_model": "multi_team_org",
+                    "company_work_item_plan": serialize_company_work_item_runtime_plan(plan),
+                },
+            )
+            set_linked_work_item_id(task, work_item.work_item_id)
+            await store.save_task(task)
+            await store.link_work_item_runtime_task(work_item.work_item_id, task.id)
+
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            adapter = _ScriptAdapter(
+                "import json,sys,time\n"
+                "print(json.dumps({'sessionID': 'provider-live-thread'}))\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(30)\n"
+            )
+            run_task = asyncio.create_task(broker.run(adapter, task, tmpdir))
+            role_state = None
+            for _ in range(200):
+                role_state = await store.get_role_session_adapter_state(
+                    role_session_id,
+                    "script_agent",
+                )
+                if role_state and role_state.get("resume_session_id"):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(role_state)
+            assert role_state is not None
+            self.assertEqual(
+                role_state["resume_session_id"],
+                "provider-live-thread",
+            )
+            self.assertFalse(run_task.done())
+
+            engine = OPCEngine()
+            engine.project_id = "proj1"
+            engine.store = store
+            await engine.suspend_company_runtime(
+                origin_task_id="ui-live",
+                session_id=parent_session_id,
+                reason="user_stop",
+            )
+            checkpoint = (
+                await store.get_pending_checkpoints(
+                    project_id="proj1",
+                    session_id=parent_session_id,
+                    checkpoint_types=["company_runtime_suspended"],
+                )
+            )[0]
+            captured = checkpoint.payload["external_sessions"][task.id]
+            self.assertEqual(
+                captured["resume_session_id"],
+                "provider-live-thread",
+            )
+            self.assertEqual(
+                captured["provider_session_id"],
+                "provider-live-thread",
+            )
+
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            resumed_task = await store.get_task(task.id)
+            assert resumed_task is not None
+            resume_adapter = _ScriptAdapter("print('unused')")
+            resume_adapter.config.resume_session_flag = "--resume"
+            await broker._restore_session_resume_from_store(
+                resume_adapter,
+                resumed_task,
+            )
+            self.assertEqual(resume_adapter.config.session_mode, "resume")
+            self.assertEqual(
+                resume_adapter.config.session_id,
+                "provider-live-thread",
+            )
+            await store.close()
+
+    async def test_codex_thread_started_stream_restores_real_resume_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            role_session_id = "role-runtime::codex-live::executor"
+            await store.save_delegation_role_session(DelegationRoleSession(
+                role_session_id=role_session_id,
+                run_id="codex-live",
+                project_id="proj1",
+                role_id="executor",
+                seat_id="seat-codex-live",
+            ))
+            task = Task(
+                id="codex-live-task",
+                title="Codex live task",
+                description="Keep the same Codex thread.",
+                project_id="proj1",
+                session_id="codex-live-child",
+                parent_session_id="codex-live-parent",
+                assigned_to="executor",
+                assigned_external_agent="codex",
+                status=TaskStatus.RUNNING,
+                metadata={
+                    "work_item_runtime": True,
+                    "delegation_role_session_id": role_session_id,
+                    "delegation_seat_id": "seat-codex-live",
+                },
+            )
+            await store.save_task(task)
+
+            class ScriptedCodexAdapter(CodexAdapter):
+                async def start_process(
+                    self,
+                    cmd: list[str],
+                    workspace_path: str,
+                    extra_env: dict[str, str] | None = None,
+                    task: Task | None = None,
+                    launch_metadata: dict[str, object] | None = None,
+                ) -> asyncio.subprocess.Process:
+                    return await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json,sys,time\n"
+                            "print(json.dumps({'type':'thread.started','thread_id':'thread-real-codex'}))\n"
+                            "sys.stdout.flush()\n"
+                            "time.sleep(30)\n"
+                        ),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=workspace_path,
+                    )
+
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            live_adapter = ScriptedCodexAdapter()
+            live_adapter.config.run_mode = "exec"
+            run_task = asyncio.create_task(
+                broker.run(live_adapter, task, tmpdir)
+            )
+            state = None
+            for _ in range(200):
+                state = await store.get_role_session_adapter_state(
+                    role_session_id,
+                    "codex",
+                )
+                if state and state.get("resume_session_id"):
+                    break
+                await asyncio.sleep(0.01)
+            assert state is not None
+            self.assertEqual(state["resume_session_id"], "thread-real-codex")
+
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            resume_adapter = CodexAdapter()
+            resumed_task = await store.get_task(task.id)
+            assert resumed_task is not None
+            await broker._restore_session_resume_from_store(
+                resume_adapter,
+                resumed_task,
+            )
+            self.assertEqual(resume_adapter.config.session_mode, "resume")
+            self.assertEqual(resume_adapter.config.session_id, "thread-real-codex")
+            cmd, _metadata = resume_adapter.build_invocation(
+                resumed_task,
+                workspace_path=tmpdir,
+            )
+            self.assertEqual(cmd[1:3], ["exec", "resume"])
+            self.assertIn("thread-real-codex", cmd)
+            self.assertEqual(cmd[-1], "-")
+            await store.close()
+
+    async def test_cleanup_cancellation_terminalizes_checkpoint_provider_token(self) -> None:
+        """A Stop checkpoint's working token cannot outlive a failed process."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = OPCStore(Path(tmpdir) / "tasks.db")
+            await store.initialize()
+            role_session_id = "role-runtime::cleanup-race::executor"
+            await store.save_delegation_role_session(DelegationRoleSession(
+                role_session_id=role_session_id,
+                run_id="cleanup-race",
+                project_id="proj1",
+                role_id="executor",
+                seat_id="seat-cleanup-race",
+            ))
+            task = Task(
+                id="cleanup-race-task",
+                title="Cleanup cancellation race",
+                description="Do not resume a provider thread that later failed.",
+                project_id="proj1",
+                session_id="cleanup-race-child",
+                parent_session_id="cleanup-race-parent",
+                assigned_to="executor",
+                assigned_external_agent="codex",
+                status=TaskStatus.RUNNING,
+                metadata={"delegation_role_session_id": role_session_id},
+            )
+            await store.save_task(task)
+            cleanup_started = asyncio.Event()
+            allow_cleanup = asyncio.Event()
+
+            class CleanupRaceCodexAdapter(CodexAdapter):
+                async def start_process(
+                    self,
+                    cmd: list[str],
+                    workspace_path: str,
+                    extra_env: dict[str, str] | None = None,
+                    task: Task | None = None,
+                    launch_metadata: dict[str, object] | None = None,
+                ) -> asyncio.subprocess.Process:
+                    return await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json,sys,time\n"
+                            "print(json.dumps({'type':'thread.started','thread_id':'thread-cleanup-race'}))\n"
+                            "sys.stdout.flush()\n"
+                            "time.sleep(.2)\n"
+                            "sys.exit(7)\n"
+                        ),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=workspace_path,
+                    )
+
+                async def cleanup_process(self, proc: asyncio.subprocess.Process) -> None:
+                    cleanup_started.set()
+                    await allow_cleanup.wait()
+                    await super().cleanup_process(proc)
+
+            broker = ExternalAgentBroker(store, _ApprovalStub())
+            live_adapter = CleanupRaceCodexAdapter()
+            run_task = asyncio.create_task(broker.run(live_adapter, task, tmpdir))
+            checkpoint_session = None
+            for _ in range(200):
+                checkpoint_session = await store.get_external_session(
+                    "codex", "proj1", task_id=task.id
+                )
+                if (
+                    checkpoint_session is not None
+                    and checkpoint_session.status == "working"
+                    and checkpoint_session.metadata.get("resume_session_id")
+                    == "thread-cleanup-race"
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            assert checkpoint_session is not None
+            self.assertEqual(checkpoint_session.status, "working")
+
+            await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            allow_cleanup.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            terminal_session = await store.get_external_session(
+                "codex", "proj1", task_id=task.id
+            )
+            assert terminal_session is not None
+            self.assertEqual(terminal_session.status, "failed")
+            self.assertGreater(
+                terminal_session.updated_at,
+                checkpoint_session.updated_at,
+            )
+
+            task.metadata.update({
+                "work_item_runtime": True,
+                "external_resume_session_id": "thread-cleanup-race",
+                "external_resume_agent_type": "codex",
+                "external_resume_session_scope_id": "cleanup-race-parent",
+                "external_resume_checkpoint_session_updated_at": (
+                    checkpoint_session.updated_at.isoformat()
+                ),
+                "external_resume_checkpoint_session_status": "working",
+            })
+            engine = OPCEngine()
+            engine.project_id = "proj1"
+            engine.store = store
+            resume_adapter, _resume_metadata = (
+                await engine._configure_external_adapter_for_task(
+                    task,
+                    CodexAdapter(),
+                )
+            )
+            self.assertEqual(resume_adapter.config.session_mode, "new")
+            self.assertEqual(resume_adapter.config.session_id, "")
+            self.assertEqual(
+                task.metadata.get("external_resume_fallback"),
+                "context_replay_provider_terminal",
+            )
             await store.close()
 
     async def test_silent_external_agent_times_out_with_reason(self) -> None:
@@ -1152,7 +1506,7 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("## Skill: memory", worker_task.description)
             self.assertIn("## Skill: memory", final_task.description)
 
-    async def test_engine_stages_uploaded_attachments_for_external_resume_prompt(self) -> None:
+    async def test_engine_provisions_uploaded_attachments_for_external_resume_prompt(self) -> None:
         engine = OPCEngine()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2159,7 +2513,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
     def test_codex_adapter_resolves_launch_binary_before_spawn(self) -> None:
         metadata: dict[str, object] = {}
 
-        with patch("opc.layer3_agent.adapters.base.shutil.which", return_value=r"C:\Tools\codex.cmd"):
+        with patch("opc.layer3_agent.adapters.base.os.name", "posix"), \
+            patch("opc.layer3_agent.adapters.base.shutil.which", return_value=r"C:\Tools\codex.cmd"):
             cmd = CodexAdapter._resolve_launch_command(
                 ["codex", "exec", "--json", "-"],
                 launch_metadata=metadata,
@@ -2169,6 +2524,39 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["configured_binary"], "codex")
         self.assertEqual(metadata["resolved_binary"], r"C:\Tools\codex.cmd")
 
+    def test_codex_adapter_wraps_windows_cmd_shim_before_spawn(self) -> None:
+        metadata: dict[str, object] = {}
+        which_results = {
+            "codex": r"D:\nodejs\codex",
+            "cmd.exe": r"C:\Windows\System32\cmd.exe",
+        }
+
+        with patch("opc.layer3_agent.adapters.base.os.name", "nt"), \
+            patch("opc.layer3_agent.adapters.base.os.path.isfile", side_effect=lambda path: path == r"D:\nodejs\codex.cmd"), \
+            patch("opc.layer3_agent.adapters.base.shutil.which", side_effect=lambda name, path=None: which_results.get(name)), \
+            patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}, clear=False):
+            cmd = CodexAdapter._resolve_launch_command(
+                ["codex", "exec", "--json", "-"],
+                launch_metadata=metadata,
+            )
+
+        self.assertEqual(
+            cmd,
+            [
+                r"C:\Windows\System32\cmd.exe",
+                "/d",
+                "/s",
+                "/c",
+                r"D:\nodejs\codex.cmd",
+                "exec",
+                "--json",
+                "-",
+            ],
+        )
+        self.assertEqual(metadata["configured_binary"], "codex")
+        self.assertEqual(metadata["resolved_binary"], r"D:\nodejs\codex.cmd")
+        self.assertEqual(metadata["launch_wrapper"], r"C:\Windows\System32\cmd.exe")
+
     def test_codex_adapter_resolves_launch_binary_with_extra_env_path(self) -> None:
         with patch("opc.layer3_agent.adapters.base.shutil.which", return_value=r"D:\bin\codex.cmd") as which_mock:
             CodexAdapter._resolve_launch_command(
@@ -2177,6 +2565,40 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(which_mock.call_args.kwargs["path"], r"D:\bin")
+
+    def test_codex_adapter_forwards_only_openopc_runtime_env_to_shell_policy(self) -> None:
+        metadata: dict[str, object] = {}
+
+        cmd = CodexAdapter._inject_runtime_shell_environment(
+            ["codex", "exec", "--json", "-"],
+            {
+                "OPC_ALLOWED_COLLAB_TOOLS": json.dumps(["delegate_work", "inbox"]),
+                "OPC_COLLAB_RPC_TOKEN": "rpc-token",
+                "PYTHONPATH": r"D:\OpenOPC",
+                "UNRELATED_SECRET": "do-not-forward",
+            },
+            launch_metadata=metadata,
+        )
+
+        self.assertEqual(cmd[:2], ["codex", "exec"])
+        config_values = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"]
+        self.assertIn(
+            "shell_environment_policy.set.OPC_ALLOWED_COLLAB_TOOLS='''delegate_work,inbox'''",
+            config_values,
+        )
+        self.assertIn(
+            "shell_environment_policy.set.OPC_COLLAB_RPC_TOKEN='''rpc-token'''",
+            config_values,
+        )
+        self.assertIn(
+            "shell_environment_policy.set.PYTHONPATH='''D:\\OpenOPC'''",
+            config_values,
+        )
+        self.assertFalse(any("UNRELATED_SECRET" in value for value in config_values))
+        self.assertEqual(
+            metadata["runtime_shell_environment_keys"],
+            ["OPC_ALLOWED_COLLAB_TOOLS", "OPC_COLLAB_RPC_TOKEN", "PYTHONPATH"],
+        )
 
     def test_codex_adapter_full_auto_uses_dangerous_bypass_flag(self) -> None:
         adapter = CodexAdapter(
@@ -2378,7 +2800,6 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
         task = Task(title="demo", description="demo")
         prompt = adapter.build_task_prompt(task)
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
 
         tmpdir = _make_test_dir("codex-no-pty-argv-prompt")
         try:
@@ -2387,6 +2808,12 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
                     "opc.layer3_agent.adapters.codex_adapter.asyncio.create_subprocess_exec",
                     AsyncMock(return_value=proc),
                 ) as spawn_mock:
+                # Build inside the no-PTY patch: build_interactive_invocation
+                # records stdin_policy/interactive_input_channel in metadata,
+                # and on a real PTY-less host build and start observe the same
+                # platform capability. Building outside the patch would bake in
+                # this host's PTY support and contradict the patched start.
+                cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
                 started = await adapter.start_process(
                     cmd,
                     tmpdir,
@@ -2710,7 +3137,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         task = Task(title="demo", description="body")
         prompt = adapter.build_task_prompt(task)
 
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
 
         self.assertEqual(cmd[-2:], ["--", prompt])
         self.assertEqual(metadata["prompt_transport"], "argv")
@@ -2723,7 +3151,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             config=ExternalAgentConfig(command="claude", approval_mode="full-auto")
         )
         task = Task(title="demo", description="body")
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
 
         tmpdir = _make_test_dir("claude-full-auto-devnull")
@@ -2752,7 +3181,8 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
             config=ExternalAgentConfig(command="claude", approval_mode="auto")
         )
         task = Task(title="demo", description="body")
-        cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+        with patch.object(ClaudeCodeAdapter, "_windows_multiline_argv_is_unsafe", return_value=False):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
         proc = type("Proc", (), {"pid": 321, "stdin": None, "stdout": object(), "stderr": object()})()
 
         tmpdir = _make_test_dir("claude-auto-approval-stdin")
@@ -2775,6 +3205,90 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(adapter.supports_approval_prompt_handling(cmd, metadata))
         self.assertEqual(spawn_mock.await_args.kwargs["stdin"], asyncio.subprocess.PIPE)
         self.assertEqual(metadata["stdin_policy"], "pipe_open")
+
+    def test_claude_adapter_windows_multiline_prompt_uses_stdin_transport(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\n在工作区里创建一个 hello.py\n\n## OpenOPC Context\nctx",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertNotIn("--", cmd)
+        self.assertNotIn(prompt, cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(cmd[cmd.index("--input-format") + 1], "text")
+        self.assertEqual(metadata["prompt_transport"], "stdin")
+        self.assertEqual(metadata["stdin_prompt_channel"], "pipe")
+        self.assertEqual(metadata["prompt_transport_reason"], "windows_multiline_argv_unsafe")
+        self.assertEqual(
+            adapter.stdin_policy_for_process(cmd, metadata),
+            "pipe_prompt_then_close",
+        )
+
+    def test_claude_adapter_windows_single_line_prompt_stays_on_argv(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="创建一个 hello.py",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertEqual(cmd[-2:], ["--", prompt])
+        self.assertEqual(metadata["prompt_transport"], "argv")
+
+    def test_claude_adapter_windows_multiline_batch_prompt_uses_stdin_transport(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\n在工作区里创建一个 hello.py",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "nt"), \
+            patch(
+                "opc.layer3_agent.adapters.claude_code.shutil.which",
+                return_value=r"C:\Users\me\AppData\Roaming\npm\claude.CMD",
+            ):
+            cmd, metadata = adapter.build_invocation(task, workspace_path="/repo")
+
+        self.assertNotIn("--", cmd)
+        self.assertNotIn(prompt, cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(metadata["prompt_transport"], "stdin")
+        self.assertEqual(metadata["prompt_transport_reason"], "windows_multiline_argv_unsafe")
+
+    def test_claude_adapter_posix_multiline_prompt_stays_on_argv(self) -> None:
+        adapter = ClaudeCodeAdapter()
+        task = Task(
+            title="demo",
+            description="## Task Brief\nline two",
+            metadata={"external_prompt_contract": "description_is_full_prompt"},
+        )
+        prompt = adapter.build_task_prompt(task)
+
+        with patch("opc.layer3_agent.adapters.claude_code.os.name", "posix"):
+            cmd, metadata = adapter.build_interactive_invocation(task, workspace_path="/repo")
+
+        self.assertEqual(cmd[-2:], ["--", prompt])
+        self.assertEqual(metadata["prompt_transport"], "argv")
 
     def test_claude_adapter_large_interactive_prompt_uses_stdin(self) -> None:
         adapter = ClaudeCodeAdapter()
@@ -3075,6 +3589,49 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, TaskStatus.DONE)
         self.assertEqual(spawn_mock.await_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+
+    def test_cursor_adapter_large_prompt_spills_to_workspace_file(self) -> None:
+        adapter = CursorAdapter(config=ExternalAgentConfig(command="cursor-agent"))
+        prompt = "x" * (CursorAdapter._ARGV_PROMPT_MAX_BYTES + 1)
+        task = Task(id="task-large", title="large", description=prompt)
+        full_prompt = adapter.build_task_prompt(task)
+        tmpdir = _make_test_dir("cursor-large-prompt-file")
+        try:
+            cmd, metadata = adapter.build_interactive_invocation(
+                task, workspace_path=tmpdir
+            )
+            self.assertEqual(metadata["prompt_transport"], "file")
+            self.assertEqual(
+                metadata["prompt_transport_reason"],
+                "prompt_too_large_for_argv",
+            )
+            prompt_file = Path(str(metadata["prompt_file"]))
+            self.assertTrue(prompt_file.is_file())
+            self.assertEqual(prompt_file.read_text(encoding="utf-8"), full_prompt)
+            self.assertNotIn(full_prompt, cmd)
+            self.assertIn(str(prompt_file), str(cmd[-1]))
+            self.assertNotIn(prompt[:64], metadata["command"])
+            self.assertLess(len(cmd[-1].encode("utf-8")), CursorAdapter._ARGV_PROMPT_MAX_BYTES)
+            # Hygiene: one stable file per task (retries overwrite) and a
+            # self-ignoring directory so workspace git never picks it up.
+            self.assertEqual(prompt_file.name, "cursor_task-large.md")
+            _cmd2, metadata2 = adapter.build_interactive_invocation(
+                task, workspace_path=tmpdir
+            )
+            self.assertEqual(metadata2["prompt_file"], str(prompt_file))
+            self.assertEqual(
+                sorted(p.name for p in prompt_file.parent.iterdir()),
+                [".gitignore", "cursor_task-large.md"],
+            )
+        finally:
+            _cleanup_test_dir(tmpdir)
+
+    def test_cursor_adapter_small_prompt_stays_on_argv(self) -> None:
+        adapter = CursorAdapter(config=ExternalAgentConfig(command="cursor-agent"))
+        task = Task(title="demo", description="short body")
+        cmd, metadata = adapter.build_invocation(task, workspace_path="/tmp/opc-ws")
+        self.assertEqual(metadata["prompt_transport"], "argv")
+        self.assertEqual(cmd[-1], adapter.build_task_prompt(task))
 
     def test_codex_adapter_mirrors_user_auth_and_config_with_copy_fallback(self) -> None:
         adapter = CodexAdapter()
@@ -4888,10 +5445,11 @@ class ExternalAgentMonitoringTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = _SessionStoreStub()
             adapter = _CollabSurfaceScriptAdapter("print('company-mode external run')\n")
-            broker = ExternalAgentBroker(store, _ApprovalStub())
             from opc.layer2_organization.org_engine import OrgEngine
             from opc.core.config import OPCConfig
-            broker.org_engine = OrgEngine(OPCConfig(), Path(tmpdir))
+            org_engine = OrgEngine(OPCConfig(), Path(tmpdir))
+            broker = ExternalAgentBroker(store, _ApprovalStub(), org_engine=org_engine)
+            self.assertIs(broker.org_engine, org_engine)
             task = Task(
                 id="collab-env-ceo",
                 title="collab env ceo",

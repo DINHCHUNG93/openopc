@@ -27,9 +27,9 @@ function mergeText(left: string, right: string, kind: 'thinking' | 'tool_call'):
 }
 
 function summarizeThinking(detail: string, fallback: string): string {
-  void detail
-  void fallback
-  return 'Thinking'
+  const text = detail.trim().replace(/\s+/g, ' ')
+  if (!text) return fallback || 'Thinking'
+  return text.length > 120 ? `${text.slice(0, 120).trimEnd()}...` : text
 }
 
 function normalizeProgressEntry(entry: ProgressEntry): ProgressEntry {
@@ -68,7 +68,7 @@ function canMergeProgress(left: ProgressEntry, right: ProgressEntry): boolean {
   if (leftKey && rightKey) return leftKey === rightKey
   if (right.timestamp - left.timestamp > STREAM_MERGE_WINDOW_MS) return false
   if (left.type !== right.type) return false
-  if (left.type === 'thinking') return true
+  if (left.type === 'thinking' || left.type === 'assistant') return true
   if (left.type === 'tool_call') return left.summary === right.summary
   return false
 }
@@ -83,11 +83,17 @@ function isDuplicateProgress(left: ProgressEntry, right: ProgressEntry): boolean
 }
 
 function mergeProgress(left: ProgressEntry, right: ProgressEntry): ProgressEntry {
-  if (left.type === 'thinking') {
-    const detail = mergeText(left.detail ?? left.summary, right.detail ?? right.summary, 'thinking')
+  if (left.type === 'thinking' || left.type === 'assistant') {
+    // Merge detail text only: summary is a label/preview ("Thinking",
+    // truncated excerpt), so falling back to it would splice label text
+    // into the middle of the merged stream. Assistant reply streams merge
+    // the same way as thinking streams.
+    const detail = mergeText(left.detail ?? '', right.detail ?? '', 'thinking')
     return {
-      timestamp: right.timestamp,
-      type: 'thinking',
+      // A stream occupies the timeline slot where it began. Deltas update the
+      // row in place instead of repeatedly re-sorting it around tool events.
+      timestamp: left.timestamp,
+      type: left.type,
       summary: summarizeThinking(detail, right.summary || left.summary),
       detail: detail || undefined,
       turnId: right.turnId ?? left.turnId,
@@ -103,7 +109,7 @@ function mergeProgress(left: ProgressEntry, right: ProgressEntry): ProgressEntry
   if (left.type === 'tool_call') {
     const mergedDetail = mergeText(left.detail ?? '', right.detail ?? '', 'tool_call')
     return {
-      timestamp: right.timestamp,
+      timestamp: left.timestamp,
       type: 'tool_call',
       summary: right.summary || left.summary,
       detail: mergedDetail || undefined,
@@ -133,8 +139,12 @@ export function appendProgressEntry(
   const actualIndex = targetIndex >= 0 ? log.length - 1 - targetIndex : log.length - 1
   const last = log[actualIndex]
   if (!last) return [normalized]
+  // The seq guard only applies within the SAME stream: when the key was not
+  // found, `last` is an unrelated entry and a fresh stream legitimately
+  // restarts at seq 1 (per-iteration thinking/assistant streams).
   if (
     normalizedKey
+    && targetIndex >= 0
     && typeof last.seq === 'number'
     && typeof normalized.seq === 'number'
     && normalized.seq <= last.seq
@@ -144,7 +154,7 @@ export function appendProgressEntry(
   if (isDuplicateProgress(last, normalized)) {
     return clampEntries([
       ...log.slice(0, actualIndex),
-      { ...last, timestamp: normalized.timestamp },
+      last,
       ...log.slice(actualIndex + 1),
     ], maxEntries)
   }

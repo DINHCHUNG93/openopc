@@ -34,6 +34,7 @@ from opc.layer2_organization.phase import (
     DONE_PHASES,
     InvalidPhaseTransition,
     coerce_phase,
+    has_open_attempt,
     phase_for_task_status,
     task_status_for_phase,
     validate_transition,
@@ -41,6 +42,54 @@ from opc.layer2_organization.phase import (
 from opc.layer2_organization.work_item_links import linked_work_item_id_for_task
 from opc.layer2_organization.work_item_identity import work_item_identity_payload
 from opc.layer2_organization.work_item_runtime import is_work_item_runtime_metadata
+
+
+def build_attempt_settlement_updates(
+    current_metadata: dict[str, Any] | None,
+    *,
+    outcome: str,
+) -> dict[str, Any]:
+    """Compute the metadata delta that settles the currently-open attempt.
+
+    ``outcome`` semantics:
+      * ``"crashed"`` — the attempt died on an exception/timeout; increments
+        ``attempt_crash_streak`` (consecutive crashes).
+      * ``"interrupted"`` — the owning process/coroutine went away without a
+        verdict (kill, cancel-before-harvest); increments
+        ``attempt_interrupted_streak``.
+      * anything else — a clean turn boundary (approved/failed-by-review/
+        waiting/park/...); resets both streaks.
+
+    Returns ``{}`` when there is no open attempt to settle, so callers can
+    merge unconditionally.
+    """
+    metadata = dict(current_metadata or {})
+    if not has_open_attempt(metadata):
+        return {}
+
+    def _streak(key: str) -> int:
+        try:
+            return int(metadata.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    outcome_clean = str(outcome or "").strip() or "settled"
+    if outcome_clean == "crashed":
+        crash_streak = _streak("attempt_crash_streak") + 1
+        interrupted_streak = _streak("attempt_interrupted_streak")
+    elif outcome_clean == "interrupted":
+        crash_streak = _streak("attempt_crash_streak")
+        interrupted_streak = _streak("attempt_interrupted_streak") + 1
+    else:
+        crash_streak = 0
+        interrupted_streak = 0
+    return {
+        "attempt_settled": True,
+        "attempt_outcome": outcome_clean,
+        "attempt_settled_at": datetime.now().isoformat(),
+        "attempt_crash_streak": crash_streak,
+        "attempt_interrupted_streak": interrupted_streak,
+    }
 
 
 async def transition_work_item(
@@ -52,6 +101,9 @@ async def transition_work_item(
     summary: str | None = None,
     metadata_updates: dict[str, Any] | None = None,
     release_claim: bool = False,
+    attempt_outcome: str | None = None,
+    blocked_reason: str | None = None,
+    handoff_status: str | None = None,
 ) -> DelegationWorkItem | None:
     """Transition a work item to ``target_phase``.
 
@@ -74,6 +126,10 @@ async def transition_work_item(
         metadata_updates: Extra metadata keys to merge onto the work item.
         release_claim: When True, clears the current claim so the dispatcher
             can re-acquire. Useful for cancel / timeout / forced-release paths.
+        blocked_reason: Optional ``blocked_reason`` column value, folded into
+            the same write as the phase change (pass ``""`` to clear).
+        handoff_status: Optional ``handoff_status`` column value, folded into
+            the same write as the phase change.
 
     Returns:
         The updated ``DelegationWorkItem``, or ``None`` when the store lacks
@@ -89,39 +145,105 @@ async def transition_work_item(
     reason_clean = str(reason or "").strip()
     if reason_clean:
         merged["last_transition_reason"] = reason_clean
+    # Attempt settlement: any transition to a non-RUNNING phase is a turn
+    # boundary for the claim that opened the current attempt (the claim CAS
+    # stamped attempt_settled=false). Fold the settlement delta into the SAME
+    # write as the phase change so an attempt can never end without its
+    # ledger entry — the structural guarantee behind the dispatcher's
+    # crash/interrupted streak brake (see phase.attempt_ledger_dispatch_
+    # block_reason).
+    settlement: dict[str, Any] = {}
+    current_item = None
+    if phase != Phase.RUNNING and hasattr(store, "get_delegation_work_item"):
+        try:
+            current_item = await store.get_delegation_work_item(work_item_id)
+        except Exception:
+            current_item = None
+        if current_item is not None:
+            settlement = build_attempt_settlement_updates(
+                dict(getattr(current_item, "metadata", {}) or {}),
+                outcome=attempt_outcome or phase.value,
+            )
+            if settlement:
+                merged = {**settlement, **merged}
     kwargs: dict[str, Any] = {
         "phase": phase,
         "metadata_updates": merged,
     }
     if summary is not None:
         kwargs["summary"] = summary
-    # Phase transition first, claim release second (when requested). The
-    # old rationale for this ordering was "sync_member_session_hook reads
-    # item.claimed_by_role_runtime_session_id"; Phase B removed that hook
-    # and moved the unpark to the dispatcher's per-tick rehydrate pass,
-    # but the two-step ordering is kept so downstream listeners that
-    # still inspect the claim (audit logs, kanban projections) see a
-    # consistent before/after.
+    if blocked_reason is not None:
+        kwargs["blocked_reason"] = blocked_reason
+    if handoff_status is not None:
+        kwargs["handoff_status"] = handoff_status
+    if release_claim:
+        # Fold claim release into the same write as the phase change: the
+        # legacy two-call sequence could commit the phase and then fail the
+        # release, stranding a dead claim. The metadata mirror keys are
+        # blanked alongside the columns so the mirror never outlives the
+        # ownership it mirrors.
+        kwargs["claimed_by_role_runtime_session_id"] = ""
+        kwargs["claimed_by_seat_id"] = ""
+        merged.setdefault("claimed_by_role_session_id", "")
+        merged.setdefault("claimed_task_id", "")
     try:
         result = await store.update_delegation_work_item(work_item_id, **kwargs)
+    except InvalidPhaseTransition:
+        # The phase write lost a race (or the caller is out of date). The
+        # attempt settlement must still land — losing it is exactly the
+        # "crash without accounting" gap that produced endless re-dispatch.
+        if settlement:
+            try:
+                await store.update_delegation_work_item(
+                    work_item_id,
+                    metadata_updates=settlement,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    f"transition_work_item: settlement fallback failed wid={work_item_id}"
+                )
+        raise
     except Exception:
         logger.opt(exception=True).warning(
             f"transition_work_item failed wid={work_item_id} "
             f"target={phase.value} reason={reason_clean}"
         )
         raise
-    if release_claim and result is not None:
-        try:
-            result = await store.update_delegation_work_item(
-                work_item_id,
-                claimed_by_role_runtime_session_id="",
-                claimed_by_seat_id="",
-            )
-        except Exception:
-            logger.opt(exception=True).warning(
-                f"transition_work_item: claim release failed wid={work_item_id}"
-            )
     return result
+
+
+async def settle_open_attempt_as_interrupted(
+    store: Any,
+    work_item: DelegationWorkItem,
+) -> bool:
+    """Back-fill the ledger for an attempt whose owner died without settling.
+
+    Metadata-only write (no phase change): the card keeps whatever phase the
+    crash left it in — recovery semantics stay untouched — but the attempt
+    stops being invisible. Called by the dispatcher's per-tick reconcile pass
+    for cards with an open attempt and no live in-process owner. Returns True
+    when a settlement write was issued.
+    """
+    if store is None or not hasattr(store, "update_delegation_work_item"):
+        return False
+    metadata = dict(getattr(work_item, "metadata", {}) or {})
+    settlement = build_attempt_settlement_updates(metadata, outcome="interrupted")
+    if not settlement:
+        return False
+    try:
+        updated = await store.update_delegation_work_item(
+            work_item.work_item_id,
+            metadata_updates=settlement,
+        )
+    except Exception:
+        logger.opt(exception=True).warning(
+            "settle_open_attempt_as_interrupted failed "
+            f"wid={getattr(work_item, 'work_item_id', '')}"
+        )
+        return False
+    if updated is not None:
+        work_item.metadata = dict(updated.metadata or {})
+    return True
 
 
 def _fallback_status_for(
@@ -162,6 +284,7 @@ async def transition_work_item_from_task(
     metadata_updates: dict[str, Any] | None = None,
     release_claim: bool = False,
     require_work_item: bool = False,
+    attempt_outcome: str | None = None,
 ) -> bool:
     """Task bridge helper: transition a work item when the caller holds a Task.
 
@@ -306,6 +429,7 @@ async def transition_work_item_from_task(
             summary=summary,
             metadata_updates=back_ref,
             release_claim=release_claim,
+            attempt_outcome=attempt_outcome,
         )
     except InvalidPhaseTransition:
         # Defensive: state-machine validation at the store layer can also
@@ -401,6 +525,23 @@ _SYNTHESIS_SKIP_KINDS: frozenset[str] = frozenset({
     "synthesize",
 })
 
+# Default dependency class when a dependency id has no entry in
+# metadata.dependency_classes. Shared with the claim-side runnability check
+# in company_mode so the frontier pass and the dispatcher never disagree on
+# whether an unlabelled dependency is hard.
+DEPENDENCY_CLASS_DEFAULT = "hard"
+
+# Roll-up kinds that may be released from WAITING_DEPENDENCIES by the
+# failure-triage settlement path: their whole job is to integrate child
+# results (including partial/failed ones) and carry them upward.
+_SETTLEMENT_ROLLUP_KINDS: frozenset[str] = frozenset({
+    "aggregate",
+    "deliver",
+    "delivery",
+    "synthesis",
+    "synthesize",
+})
+
 
 def _work_item_id(item: DelegationWorkItem | Any | None) -> str:
     return str(getattr(item, "work_item_id", "") or "").strip()
@@ -491,6 +632,94 @@ def normalize_dependency_work_item_ids(
     )
 
 
+def compute_doomed_work_item_ids(
+    work_item_by_id: dict[str, DelegationWorkItem | Any],
+) -> set[str]:
+    """Ids of work items that can never reach APPROVED on their own.
+
+    Seeds are FAILED/CANCELLED items. Propagation: a QUEUED /
+    WAITING_DEPENDENCIES / READY item whose hard dependency is doomed (and
+    not APPROVED) can never become runnable, so it is doomed too. Pure
+    fixpoint over the run snapshot — no IO. Dependencies are normalized
+    first, so a doomed card that was rewired via ``delete_work_item`` +
+    replacement ids drops back out of the set.
+    """
+    doomed: set[str] = {
+        item_id
+        for item_id, item in work_item_by_id.items()
+        if getattr(item, "phase", None) in (Phase.FAILED, Phase.CANCELLED)
+    }
+    if not doomed:
+        return doomed
+    changed = True
+    while changed:
+        changed = False
+        for item_id, item in work_item_by_id.items():
+            if item_id in doomed:
+                continue
+            if getattr(item, "phase", None) not in (
+                Phase.QUEUED,
+                Phase.WAITING_DEPENDENCIES,
+                Phase.READY,
+            ):
+                continue
+            metadata = dict(getattr(item, "metadata", {}) or {})
+            # A card carrying a settlement stamp was RELEASED by the
+            # frontier pass over its failures — it is alive (a runnable
+            # triage card), not doomed. Marking it doomed would let an
+            # upper parent settle early and, worse, let that parent's
+            # cascade cancel a triage card that is about to run.
+            if dict(metadata.get("dependency_settlement", {}) or {}):
+                continue
+            raw_ids = [
+                str(dep).strip()
+                for dep in list(metadata.get("dependency_work_item_ids", []) or [])
+                if str(dep).strip()
+            ]
+            if not raw_ids:
+                continue
+            dep_ids, _pruned = normalize_dependency_work_item_ids(
+                raw_ids, work_item_by_id, owner_work_item_id=item_id
+            )
+            dependency_classes = dict(metadata.get("dependency_classes", {}) or {})
+            for dep_id in dep_ids:
+                dep = work_item_by_id.get(dep_id)
+                if dep is None or dep_id not in doomed:
+                    continue
+                dep_class = str(
+                    dependency_classes.get(dep_id, DEPENDENCY_CLASS_DEFAULT)
+                    or DEPENDENCY_CLASS_DEFAULT
+                ).strip().lower()
+                if dep_class in ("soft", "info"):
+                    continue
+                if getattr(dep, "phase", None) == Phase.APPROVED:
+                    continue
+                doomed.add(item_id)
+                changed = True
+                break
+    return doomed
+
+
+def settled_failure_dependency_ids(metadata: dict[str, Any] | None) -> set[str]:
+    """Dependency ids this card was explicitly released over despite failure.
+
+    Includes the ``stuck`` ids (transitively-blocked, still non-terminal):
+    a released triage card must be claimable even while its stuck
+    dependencies linger — they are settled context awaiting rebuild or the
+    settlement cascade, not blockers. Reads the ``dependency_settlement``
+    stamp that ``refresh_dependents_for_run`` writes in the same update
+    that wakes the card, so only the frontier pass — never ad-hoc metadata
+    edits — can authorize running over an unsatisfied hard dependency.
+    """
+    settlement = dict((metadata or {}).get("dependency_settlement", {}) or {})
+    return {
+        str(item).strip()
+        for key in ("failed", "cancelled", "stuck")
+        for item in list(settlement.get(key, []) or [])
+        if str(item).strip()
+    }
+
+
 def _work_item_kind(item: DelegationWorkItem, metadata: dict[str, Any]) -> str:
     return str(
         metadata.get("work_kind")
@@ -498,6 +727,120 @@ def _work_item_kind(item: DelegationWorkItem, metadata: dict[str, Any]) -> str:
         or item.kind
         or ""
     ).strip().lower()
+
+
+def _dependency_settlement_snapshot(
+    metadata: dict[str, Any],
+    dependency_phases: dict[str, Any],
+    doomed_ids: set[str],
+) -> dict[str, Any]:
+    """Single truth for the failure-triage gate over one card's deps.
+
+    "Settled with failures": every dependency is terminal or doomed
+    (transitively blocked by a terminal failure), so waiting longer cannot
+    change the outcome. The failure may be purely transitive (a direct dep
+    is stuck behind a FAILED card elsewhere), so the trigger counts stuck
+    deps too. Info-class deps never gate claiming, so they do not gate
+    settlement either. Missing deps (phase None) stay unsettled.
+    """
+    dependency_class_map = dict(metadata.get("dependency_classes", {}) or {})
+
+    def _dep_is_info(dep_id: str) -> bool:
+        return str(
+            dependency_class_map.get(dep_id, DEPENDENCY_CLASS_DEFAULT)
+            or DEPENDENCY_CLASS_DEFAULT
+        ).strip().lower() == "info"
+
+    all_approved = all(p == Phase.APPROVED for p in dependency_phases.values())
+    failed = [d for d, p in dependency_phases.items() if p == Phase.FAILED]
+    cancelled = [d for d, p in dependency_phases.items() if p == Phase.CANCELLED]
+    stuck = [
+        d
+        for d, p in dependency_phases.items()
+        if d in doomed_ids and p not in (Phase.FAILED, Phase.CANCELLED)
+    ]
+    settled_with_failures = (
+        not all_approved
+        and bool(failed or cancelled or stuck)
+        and all(
+            (p is not None and p in DONE_PHASES)
+            or dep_id in doomed_ids
+            or _dep_is_info(dep_id)
+            for dep_id, p in dependency_phases.items()
+        )
+    )
+    return {
+        "all_approved": all_approved,
+        "failed": failed,
+        "cancelled": cancelled,
+        "stuck": stuck,
+        "settled_with_failures": settled_with_failures,
+    }
+
+
+def _is_settlement_release_candidate(
+    item: DelegationWorkItem | Any,
+    metadata: dict[str, Any],
+) -> bool:
+    """Cards a failure-triage release may wake: the delegating parent, a
+    roll-up card, or an already-released (stamped) in-flight triage card."""
+    phase = getattr(item, "phase", None)
+    if phase == Phase.WAITING_FOR_CHILDREN:
+        return True
+    if phase == Phase.WAITING_DEPENDENCIES and _work_item_kind(item, metadata) in _SETTLEMENT_ROLLUP_KINDS:
+        return True
+    return phase in (Phase.READY, Phase.READY_FOR_REWORK, Phase.RUNNING) and bool(
+        dict(metadata.get("dependency_settlement", {}) or {})
+    )
+
+
+def has_pending_settlement_release(
+    work_item_by_id: dict[str, DelegationWorkItem | Any],
+) -> bool:
+    """True when some card is due a failure-triage release.
+
+    Used by the dispatcher tick for cards created AFTER their dependency
+    already failed: the failure's transition hook predates the card, so no
+    future event would ever run the frontier for it. Cards already
+    released (stamp present, phase moved) return False here, keeping the
+    tick idempotent.
+    """
+    doomed_ids = compute_doomed_work_item_ids(work_item_by_id)
+    if not doomed_ids:
+        return False
+    for item_id, item in work_item_by_id.items():
+        metadata = dict(getattr(item, "metadata", {}) or {})
+        phase = getattr(item, "phase", None)
+        if not (
+            phase == Phase.WAITING_FOR_CHILDREN
+            or (
+                phase == Phase.WAITING_DEPENDENCIES
+                and _work_item_kind(item, metadata) in _SETTLEMENT_ROLLUP_KINDS
+            )
+        ):
+            continue
+        raw_ids = [
+            str(dep).strip()
+            for dep in list(metadata.get("dependency_work_item_ids", []) or [])
+            if str(dep).strip()
+        ]
+        if not raw_ids:
+            continue
+        dependency_ids, _pruned = normalize_dependency_work_item_ids(
+            raw_ids, work_item_by_id, owner_work_item_id=item_id
+        )
+        dependency_phases = {
+            dep_id: (
+                getattr(work_item_by_id[dep_id], "phase", None)
+                if dep_id in work_item_by_id
+                else None
+            )
+            for dep_id in dependency_ids
+        }
+        snapshot = _dependency_settlement_snapshot(metadata, dependency_phases, doomed_ids)
+        if snapshot["settled_with_failures"]:
+            return True
+    return False
 
 
 def _should_enter_synthesis_turn(
@@ -534,6 +877,30 @@ def _synthesis_turn_summary(item: DelegationWorkItem, dependency_ids: list[str])
     )
 
 
+def _failure_triage_turn_summary(
+    item: DelegationWorkItem,
+    dependency_phases: dict[str, Any],
+    failed_ids: list[str],
+    cancelled_ids: list[str],
+    stuck_ids: list[str],
+) -> str:
+    title = str(item.title or "delegated work").strip()
+    manager_label = str(item.manager_role_id or "the upstream owner").strip()
+    approved_count = sum(1 for p in dependency_phases.values() if p == Phase.APPROVED)
+    parts = [
+        f"{approved_count} approved",
+        f"{len(failed_ids) + len(cancelled_ids)} failed/cancelled",
+    ]
+    if stuck_ids:
+        parts.append(f"{len(stuck_ids)} blocked downstream")
+    return (
+        f"Triage the delegated results for `{title}` ({', '.join(parts)}). "
+        "Decide how to handle the failures — rebuild the failed work, accept "
+        "partial results, or escalate the gap — then prepare the handoff for "
+        f"{manager_label}."
+    )
+
+
 async def refresh_dependents_for_run(
     store: Any,
     *,
@@ -554,6 +921,13 @@ async def refresh_dependents_for_run(
       children are all approved; otherwise ``WAITING_FOR_CHILDREN → RUNNING``.
       Both paths release the parent's stale claim so the dispatcher can
       re-pick it cleanly.
+    - Failure-triage release: when every dep is settled (terminal) or
+      doomed (transitively blocked by a FAILED/CANCELLED dep) and at least
+      one failed, the delegating parent / roll-up card is released anyway
+      with a ``dependency_settlement`` stamp, so a single failure can
+      never wedge the whole tree in WAITING_FOR_CHILDREN forever. Once
+      that card reaches APPROVED, leftover doomed descendants it did not
+      rebuild are cancelled (settlement cascade) so the run can finalize.
     - Reverse direction: a RUNNING item whose deps regress (new dep
       appeared) goes to ``WAITING_FOR_CHILDREN``; a READY item to
       ``WAITING_DEPENDENCIES``.
@@ -590,6 +964,7 @@ async def refresh_dependents_for_run(
             )
             return False
         work_item_by_id = {item.work_item_id: item for item in work_items}
+        doomed_ids = compute_doomed_work_item_ids(work_item_by_id)
         changed = False
         for work_item in work_items:
             metadata = dict(work_item.metadata or {})
@@ -609,7 +984,15 @@ async def refresh_dependents_for_run(
                 dep_id: (work_item_by_id[dep_id].phase if dep_id in work_item_by_id else None)
                 for dep_id in dependency_ids
             }
-            all_approved = all(p == Phase.APPROVED for p in dependency_phases.values())
+            settlement_snapshot = _dependency_settlement_snapshot(
+                metadata, dependency_phases, doomed_ids
+            )
+            all_approved = settlement_snapshot["all_approved"]
+            failed_dep_ids = settlement_snapshot["failed"]
+            cancelled_dep_ids = settlement_snapshot["cancelled"]
+            stuck_dep_ids = settlement_snapshot["stuck"]
+            all_settled_with_failures = settlement_snapshot["settled_with_failures"]
+            settlement_release = False
             target_phase = work_item.phase
             metadata_updates: dict[str, Any] = {}
             summary_update: str | None = None
@@ -677,33 +1060,111 @@ async def refresh_dependents_for_run(
                     metadata_updates["delegated_children_pending"] = False
                 if str(metadata.get("frontier", "") or "") == "waiting_for_children" and not entered_synthesis_turn:
                     metadata_updates["frontier"] = "resumed"
+            elif all_settled_with_failures and _is_settlement_release_candidate(
+                work_item, metadata
+            ):
+                # Failure-triage release: a FAILED/CANCELLED child must not
+                # wedge the whole tree forever. Wake the card that owns the
+                # decision (the delegating parent, or a roll-up card) and put
+                # the failure context in the SAME write, so the released turn
+                # cannot silently succeed without seeing it. Ordinary sibling
+                # cards blocked on the failure are NOT released — they are in
+                # ``stuck`` and get rebuilt, rewired, or cancelled by the
+                # settlement cascade once the triage card completes.
+                settlement_release = True
+                if work_item.phase in (Phase.READY, Phase.READY_FOR_REWORK, Phase.RUNNING):
+                    # Already released over this settlement: leave it
+                    # untouched. Regressing it back to a waiting phase (the
+                    # generic not-all-approved branch below) would oscillate
+                    # a released triage card straight back into the deadlock.
+                    pass
+                elif work_item.phase == Phase.WAITING_FOR_CHILDREN:
+                    if _should_enter_synthesis_turn(work_item, metadata, dependency_ids):
+                        entered_synthesis_turn = True
+                        target_phase = Phase.READY
+                        previous_kind = _work_item_kind(work_item, metadata)
+                        metadata_updates.update(
+                            {
+                                "pre_synthesis_work_kind": previous_kind,
+                                "work_kind": "synthesize",
+                                "delegation_turn_kind": "synthesize",
+                                **work_item_identity_payload(
+                                    projection_id=str(work_item.projection_id or work_item.work_item_id or ""),
+                                    turn_type="aggregate",
+                                ),
+                                "current_turn_mode": "synthesize_required",
+                                "synthesis_turn_started": True,
+                                "synthesis_ready_at": datetime.now().isoformat(),
+                                "synthesis_source_work_item_ids": list(dependency_ids),
+                                "synthesis_reports_to_role_id": str(work_item.manager_role_id or "").strip(),
+                                "synthesis_reports_to_seat_id": str(work_item.manager_seat_id or "").strip(),
+                                "needs_manager_attention": False,
+                            }
+                        )
+                    else:
+                        target_phase = Phase.RUNNING
+                        if _work_item_kind(work_item, metadata) in {"deliver", "delivery"}:
+                            metadata_updates.update(
+                                {
+                                    "work_kind": "delivery",
+                                    "delegation_turn_kind": "delivery",
+                                    **work_item_identity_payload(
+                                        projection_id=str(work_item.projection_id or work_item.work_item_id or ""),
+                                        turn_type="deliver",
+                                    ),
+                                    "current_turn_mode": "deliver_required",
+                                    "delivery_turn_ready_at": datetime.now().isoformat(),
+                                }
+                            )
+                else:
+                    target_phase = (
+                        Phase.READY_FOR_REWORK
+                        if str(metadata.get("rework_feedback", "") or "").strip()
+                        else Phase.READY
+                    )
+                if target_phase != work_item.phase:
+                    summary_update = _failure_triage_turn_summary(
+                        work_item,
+                        dependency_phases,
+                        failed_dep_ids,
+                        cancelled_dep_ids,
+                        stuck_dep_ids,
+                    )
+                    metadata_updates["dependency_settlement"] = {
+                        "failed": list(failed_dep_ids),
+                        "cancelled": list(cancelled_dep_ids),
+                        "stuck": list(stuck_dep_ids),
+                        "settled_at": datetime.now().isoformat(),
+                    }
+                    metadata_updates["frontier"] = "settlement_ready"
+                    metadata_updates["waiting_on_work_item_ids"] = []
+                    if metadata.get("delegated_children_pending"):
+                        metadata_updates["delegated_children_pending"] = False
             else:
                 if work_item.phase == Phase.READY:
                     target_phase = Phase.WAITING_DEPENDENCIES
                 elif work_item.phase == Phase.RUNNING:
                     target_phase = Phase.WAITING_FOR_CHILDREN
                 metadata_updates["waiting_on_work_item_ids"] = dependency_ids
-            # Clear the parent claim whenever the parent truly leaves
-            # WAITING_FOR_CHILDREN toward a non-terminal phase. The old
-            # condition ("only when all children approved AND target is
-            # RUNNING") left a gap: when a child went READY_FOR_REWORK,
-            # the refresh now fires (per _DEPENDENT_REFRESH_TARGETS) but
-            # the parent stayed in WAITING_FOR_CHILDREN with a stale claim,
-            # so the dispatcher couldn't re-pick it even though the child
-            # was back on the worker's queue.
-            # We exclude DONE_PHASES because for terminal parents the
-            # claim is a historical audit record of "last executor".
+            # Waking a parent out of WAITING_FOR_CHILDREN must orphan it so
+            # the dispatcher can re-pick it. For READY targets the store's
+            # phase-write invariant releases ownership; only the direct
+            # →RUNNING wake still needs the explicit clear (columns and
+            # mirror in the same write). Terminal targets keep the claim as
+            # a historical audit record of "last executor".
             clear_claim_on_wake = (
                 work_item.phase == Phase.WAITING_FOR_CHILDREN
-                and target_phase != work_item.phase
-                and target_phase not in DONE_PHASES
+                and target_phase == Phase.RUNNING
             )
-            if target_phase != work_item.phase or metadata_updates or clear_claim_on_wake:
+            if clear_claim_on_wake:
+                metadata_updates["claimed_by_role_session_id"] = ""
+                metadata_updates["claimed_task_id"] = ""
+            if target_phase != work_item.phase or metadata_updates:
                 try:
                     await store.update_delegation_work_item(
                         work_item.work_item_id,
                         phase=target_phase if target_phase != work_item.phase else None,
-                        blocked_reason="" if all_approved else None,
+                        blocked_reason="" if (all_approved or settlement_release) else None,
                         metadata_updates=metadata_updates or None,
                         summary=summary_update,
                         claimed_by_role_runtime_session_id="" if clear_claim_on_wake else None,
@@ -715,6 +1176,108 @@ async def refresh_dependents_for_run(
                         "refresh_dependents_for_run: update_delegation_work_item failed "
                         f"wid={work_item.work_item_id}"
                     )
+        # Settlement cascade: once a failure-triage card reaches APPROVED
+        # (auto-approved synthesis or human-approved delivery), any stuck
+        # descendants it chose not to rebuild are dead branches — cancel
+        # them so the run reaches a fully-terminal state and can finalize.
+        # Children the manager rebuilt or rewired (delete_work_item +
+        # replacement ids) have dropped out of the doomed set and survive.
+        for work_item in work_items:
+            metadata = dict(work_item.metadata or {})
+            settlement = dict(metadata.get("dependency_settlement", {}) or {})
+            if not settlement or settlement.get("cascaded_at"):
+                continue
+            if work_item.phase != Phase.APPROVED:
+                continue
+            # Transitive closure through the doomed set: cancelling a stuck
+            # child kills anything hard-chained onto it, and those deeper
+            # nodes appear in no released card's direct dependency list —
+            # without the closure they would linger non-terminal forever.
+            # `covered` seeds from ALL stamped stuck ids regardless of
+            # phase: a stuck child already cancelled by a previous
+            # (partially failed) cascade attempt must still conduct the
+            # traversal, or the deeper nodes behind it become unreachable
+            # on retry. Growth only follows edges INTO the covered set, so
+            # doomed subtrees owned by a different (not-yet-approved)
+            # triage card are left for that card's own decision.
+            covered_ids: set[str] = {
+                str(item).strip()
+                for item in list(settlement.get("stuck", []) or [])
+                if str(item).strip() and str(item).strip() in work_item_by_id
+            }
+            grew = bool(covered_ids)
+            while grew:
+                grew = False
+                for item_id, item in work_item_by_id.items():
+                    if item_id in covered_ids or item_id not in doomed_ids:
+                        continue
+                    item_metadata = dict(getattr(item, "metadata", {}) or {})
+                    raw_ids = [
+                        str(dep).strip()
+                        for dep in list(item_metadata.get("dependency_work_item_ids", []) or [])
+                        if str(dep).strip()
+                    ]
+                    if not raw_ids:
+                        continue
+                    dep_ids, _pruned = normalize_dependency_work_item_ids(
+                        raw_ids, work_item_by_id, owner_work_item_id=item_id
+                    )
+                    item_classes = dict(item_metadata.get("dependency_classes", {}) or {})
+                    for dep_id in dep_ids:
+                        if dep_id not in covered_ids:
+                            continue
+                        dep_class = str(
+                            item_classes.get(dep_id, DEPENDENCY_CLASS_DEFAULT)
+                            or DEPENDENCY_CLASS_DEFAULT
+                        ).strip().lower()
+                        if dep_class in ("soft", "info"):
+                            continue
+                        covered_ids.add(item_id)
+                        grew = True
+                        break
+            cancel_ids = {
+                covered_id
+                for covered_id in covered_ids
+                if covered_id in doomed_ids
+                and getattr(work_item_by_id.get(covered_id), "phase", None)
+                not in DONE_PHASES
+            }
+            cascade_complete = True
+            for cancel_id in sorted(cancel_ids):
+                try:
+                    await transition_work_item(
+                        store,
+                        cancel_id,
+                        target_phase=Phase.CANCELLED,
+                        reason="upstream_dependency_failed_parent_settled",
+                        release_claim=True,
+                    )
+                    changed = True
+                except Exception:
+                    cascade_complete = False
+                    logger.opt(exception=True).debug(
+                        "refresh_dependents_for_run: settlement cascade cancel failed "
+                        f"wid={cancel_id}"
+                    )
+            if not cascade_complete:
+                # Leave cascaded_at unset so the next refresh retries the
+                # leftover cancels instead of permanently orphaning them.
+                continue
+            try:
+                await store.update_delegation_work_item(
+                    work_item.work_item_id,
+                    metadata_updates={
+                        "dependency_settlement": {
+                            **settlement,
+                            "cascaded_at": datetime.now().isoformat(),
+                        }
+                    },
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "refresh_dependents_for_run: settlement cascade stamp failed "
+                    f"wid={work_item.work_item_id}"
+                )
         if changed and hasattr(store, "save_delegation_event"):
             try:
                 await store.save_delegation_event(

@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useVirtualizer } from '@tanstack/react-virtual'
 import type { AttachmentRefMeta, ChatMessage, CheckpointReplyMetadata } from '../types/chat'
 import type { ProgressEntry, RoleWorkItemSummary, Session, WorkItemProgressEntry } from '../types/kanban'
 import { progressEntryKey } from '../lib/progressEntryKey'
+import { stableMessageTimelineKey } from '../lib/messageTimelineIdentity'
+import { isMessageVisibleAtDetailLevel, resultSurfaceDedupeKey } from '../lib/workItemSessions'
+import { resolveCanonicalTurnId, terminalAssistantTurnId } from '../lib/turnIdentity'
 import { IconCopy, IconCheck, IconChat, IconSparkle, IconShield, IconActivity, IconChevron } from './SvgIcons'
 import { AgentProgressBlock, AgentProgressEntryCard, INLINE_PROGRESS_ENTRY_TYPES } from './AgentProgressBlock'
 import { MarkdownBody } from './MarkdownBody'
@@ -107,6 +109,7 @@ function AttachmentBlock({ refs, onImageClick }: { refs: AttachmentRefMeta[]; on
 
 type ViewKind = 'session' | 'activity' | 'secretary'
 type DetailMode = 'summary' | 'full'
+export type MessageScrollPolicy = 'follow' | 'initial-bottom' | 'manual'
 
 interface MessageListProps {
   messages: ChatMessage[]
@@ -141,8 +144,9 @@ interface MessageListProps {
   totalMessageCount?: number
   onLoadOlderHistory?: (oldestMessage?: ChatMessage) => Promise<void> | void
   loadingOlderHistory?: boolean
-  autoScroll?: boolean
-  initialScrollToBottom?: boolean
+  scrollPolicy?: MessageScrollPolicy
+  /** Stable identity for the scroll state owned by this list instance. */
+  scrollScope?: string
   showWorkItemRuntimeCard?: boolean
   showRuntimeProgress?: boolean
   renderUserMarkdown?: boolean
@@ -153,6 +157,87 @@ type TimelineItem =
   | { kind: 'progress'; id: string; timestamp: number; entry: ProgressEntry; sortOrder: number }
   | { kind: 'draft'; id: string; timestamp: number; text: string; iteration?: number; sortOrder: number }
   | { kind: 'ops-bundle'; id: string; timestamp: number; events: SystemOpsBundleEvent[]; sortOrder: number }
+
+type TimelineItemSemanticToken = readonly unknown[]
+const semanticObjectTokenCache = new WeakMap<object, string>()
+
+function semanticObjectToken(value: unknown): string {
+  if (!value || typeof value !== 'object') return ''
+  const cached = semanticObjectTokenCache.get(value)
+  if (cached !== undefined) return cached
+  const serialized = JSON.stringify(value) ?? ''
+  semanticObjectTokenCache.set(value, serialized)
+  return serialized
+}
+
+function timelineItemSemanticToken(item: TimelineItem): TimelineItemSemanticToken {
+  if (item.kind === 'message') {
+    const { msg } = item
+    return [
+      item.kind,
+      item.id,
+      item.timestamp,
+      msg.sender,
+      msg.senderName,
+      msg.senderDeleted,
+      msg.content,
+      msg.replyToId,
+      semanticObjectToken(msg.mentions),
+      semanticObjectToken(msg.metadata),
+    ]
+  }
+  if (item.kind === 'progress') {
+    const { entry } = item
+    return [
+      item.kind,
+      item.id,
+      item.timestamp,
+      entry.type,
+      entry.summary,
+      entry.detail,
+      entry.turnId,
+      entry.itemId,
+      entry.streamId,
+      entry.toolCallId,
+      entry.permissionGroupKey,
+      entry.seq,
+      entry.executionMode,
+    ]
+  }
+  if (item.kind === 'draft') {
+    return [item.kind, item.id, item.timestamp, item.text, item.iteration]
+  }
+  const token: unknown[] = [
+    item.kind,
+    item.id,
+    item.timestamp,
+  ]
+  for (const { msg, classification } of item.events) {
+    token.push(
+      msg.id,
+      msg.timestamp,
+      msg.content,
+      semanticObjectToken(msg.metadata),
+      classification.kind,
+      classification.label,
+      classification.summary,
+      classification.tone,
+    )
+  }
+  return token
+}
+
+function semanticTokenArraysEqual(
+  left: TimelineItemSemanticToken[] | null,
+  right: TimelineItemSemanticToken[],
+): boolean {
+  if (!left || left.length !== right.length) return false
+  return right.every((token, itemIndex) => {
+    const previous = left[itemIndex]
+    return previous.length === token.length
+      && token.every((value, valueIndex) => value === previous[valueIndex])
+  })
+}
 
 interface ProjectUpdatePayload {
   kind: 'report' | 'review' | 'update'
@@ -244,30 +329,21 @@ const WELCOME: Record<ViewKind, { icon: React.ReactNode; title: string; hint: st
 const GROUP_WINDOW = 5 * 60_000
 const INITIAL_VISIBLE_TIMELINE_ITEMS = 200
 const VISIBLE_TIMELINE_STEP = 200
-const FOLLOW_BOTTOM_THRESHOLD_PX = 96
-const SCROLL_TOP_EPSILON_PX = 1
-const PROGRAMMATIC_SCROLL_GRACE_MS = 700
+const BOTTOM_GAP_EPSILON_PX = 2
 
 function isNearScrollBottom(el: HTMLElement): boolean {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_BOTTOM_THRESHOLD_PX
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_GAP_EPSILON_PX
 }
 
-export function shouldReleaseStickToBottomOnScroll({
-  previousScrollTop,
-  nextScrollTop,
-  atBottom,
-  userScrolling,
-  programmaticScroll,
-}: {
-  previousScrollTop: number
-  nextScrollTop: number
-  atBottom: boolean
-  userScrolling: boolean
-  programmaticScroll: boolean
-}): boolean {
-  if (programmaticScroll || atBottom) return false
-  if (userScrolling) return true
-  return nextScrollTop < previousScrollTop - SCROLL_TOP_EPSILON_PX
+function isDurableTimelineMessage(message: ChatMessage): boolean {
+  // ChatStore reserves `msg-*` for local optimistic echoes. They may render in
+  // the timeline immediately, but cannot advance a persistent read cursor
+  // until the backend acknowledgement replaces them.
+  return !String(message.id ?? '').startsWith('msg-')
+}
+
+export function messageTimelineKey(message: ChatMessage): string {
+  return stableMessageTimelineKey(message)
 }
 
 function formatTime(ts: number) {
@@ -310,55 +386,12 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-function messageVisibleInDetailMode(message: ChatMessage, detailMode: DetailMode): boolean {
-  if (detailMode === 'full') return true
-  return String(message.metadata?.detail_visibility ?? 'summary').trim() !== 'full'
-}
-
 function isExecutionContextMessage(message: ChatMessage): boolean {
   return String(message.metadata?.transcript_kind ?? '').trim() === 'runtime_v2_user_turn'
 }
 
 function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim()
-}
-
-function stripNarrativeTitlePrefix(content: string): string {
-  const trimmed = String(content || '').trim()
-  const markdownTitle = trimmed.match(/^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$/)
-  if (markdownTitle) {
-    const body = markdownTitle[2].trim()
-    if (body.length >= 80) return body
-  }
-  const colonIndex = trimmed.indexOf(': ')
-  if (colonIndex < 8 || colonIndex > 160) return trimmed
-
-  const prefix = trimmed.slice(0, colonIndex).replace(/\*/g, '').trim()
-  const body = trimmed.slice(colonIndex + 2).trim()
-  if (body.length < 80) return trimmed
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(prefix)) return trimmed
-  if (/^(https?|file)$/i.test(prefix)) return trimmed
-  return body
-}
-
-function isResultSurfaceMessage(message: ChatMessage): boolean {
-  const transcriptKind = String(message.metadata?.transcript_kind ?? message.metadata?.kind ?? '').trim()
-  if ([
-    'runtime_v2_assistant',
-    'runtime_v2_company_assistant',
-    'top_level_reply',
-    'company_role_result',
-    'company_role_result_retry',
-    'child_task_result',
-    'child_task_result_retry',
-    'child_result',
-  ].includes(transcriptKind)) {
-    return true
-  }
-  if (String(message.metadata?.kind ?? '').trim() === 'worker_notification') {
-    return true
-  }
-  return false
 }
 
 function parseJsonObjectText(content: string): Record<string, unknown> | null {
@@ -753,16 +786,13 @@ export function buildNarrativeMessageItems(
   const items: TimelineItem[] = []
   let bundle: SystemOpsBundleEvent[] = []
   let bundleSortOrder = 0
-  const seenProjectUpdates = new Set<string>()
-  const seenNarrativeMessages = new Set<string>()
 
   const flushBundle = () => {
     if (bundle.length === 0) return
     const first = bundle[0].msg
-    const last = bundle[bundle.length - 1].msg
     items.push({
       kind: 'ops-bundle',
-      id: `ops:${first.id}:${bundle.length}:${last.id}`,
+      id: `ops:${messageTimelineKey(first)}`,
       timestamp: first.timestamp,
       events: bundle,
       sortOrder: bundleSortOrder,
@@ -778,37 +808,10 @@ export function buildNarrativeMessageItems(
       bundle.push(ops)
       return
     }
-    const projectUpdate = detailMode === 'summary' ? parseProjectUpdatePayload(msg.content) : null
-    if (projectUpdate) {
-      const dedupeKey = [
-        msg.sender,
-        Math.round(msg.timestamp / 1000),
-        projectUpdate.kind,
-        compactWhitespace(projectUpdate.summary || projectUpdate.acceptanceSummary || '').slice(0, 500),
-        projectUpdate.verdict ?? '',
-        projectUpdate.deliverables.map(item => `${item.name}:${item.path}`).join('|').slice(0, 800),
-      ].join('\u0001')
-      if (seenProjectUpdates.has(dedupeKey)) return
-      seenProjectUpdates.add(dedupeKey)
-    }
-    if (detailMode === 'summary') {
-      const canonicalContent = compactWhitespace(stripNarrativeTitlePrefix(msg.content)).slice(0, 1200)
-      if (canonicalContent) {
-        const dedupeKey = isResultSurfaceMessage(msg)
-          ? ['result', canonicalContent].join('\u0001')
-          : [
-              msg.sender,
-              Math.round(msg.timestamp / 1000),
-              canonicalContent,
-            ].join('\u0001')
-        if (seenNarrativeMessages.has(dedupeKey)) return
-        seenNarrativeMessages.add(dedupeKey)
-      }
-    }
     flushBundle()
     items.push({
       kind: 'message',
-      id: msg.id,
+      id: messageTimelineKey(msg),
       timestamp: msg.timestamp,
       msg,
       sortOrder,
@@ -1016,10 +1019,11 @@ interface AgentRowProps {
   isCopied: boolean
   isCheckpointResponded: boolean
   suppressCheckpointPanel: boolean
+  keepExpanded?: boolean
   onCopy: (id: string, content: string) => void
   onSend?: (text: string, taskId?: string, metadata?: CheckpointReplyMetadata) => void
 }
-const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGrouped, isCopied, isCheckpointResponded, suppressCheckpointPanel, onCopy, onSend }: AgentRowProps) {
+const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGrouped, isCopied, isCheckpointResponded, suppressCheckpointPanel, keepExpanded, onCopy, onSend }: AgentRowProps) {
   const isDeleted = !!msg.senderDeleted
   const displayName = isDeleted ? '[Deleted]' : msg.senderName
   const color = agentColor(msg.sender === 'system' ? (msg.senderName || 'OPC') : msg.sender)
@@ -1105,7 +1109,7 @@ const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGroupe
             </>
           ) : (
             <div className="msg-content-agent-card" style={{ borderLeftColor: color }}>
-              <MarkdownBody content={msg.content} />
+              <MarkdownBody content={msg.content} collapseMode={keepExpanded ? 'never' : 'auto'} />
               <div className="msg-card-actions">
                 <button className="msg-action-btn" onClick={() => onCopy(msg.id, msg.content)} title="Copy message">
                   {isCopied ? <><IconCheck /> <span>Copied</span></> : <><IconCopy /> <span>Copy</span></>}
@@ -1121,6 +1125,18 @@ const AgentRow = React.memo(function AgentRow({ msg, showDate, dateStr, isGroupe
     </div>
   )
 })
+
+type ViewportMode = 'following' | 'browsing'
+
+interface ViewportAnchor {
+  key: string
+  viewportOffset: number
+}
+
+interface TimelineWindowState {
+  scope: string
+  startKey: string | null
+}
 
 export const MessageList = React.memo(function MessageList({
   messages,
@@ -1143,154 +1159,91 @@ export const MessageList = React.memo(function MessageList({
   executorRoleWorkItems,
   onSend,
   onWorkItemClick,
-  onWorkItemOpenSession,
   onMarkRead,
   hasOlderHistory = false,
   totalMessageCount,
   onLoadOlderHistory,
   loadingOlderHistory = false,
-  autoScroll = true,
-  initialScrollToBottom = true,
+  scrollPolicy = 'follow',
+  scrollScope: scrollScopeProp,
   showWorkItemRuntimeCard = true,
   showRuntimeProgress = true,
   renderUserMarkdown = false,
 }: MessageListProps) {
+  const scrollScope = scrollScopeProp ?? `${viewKind}:${detailMode}:${channelName}`
   const listRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null)
-  const [visibleTimelineCount, setVisibleTimelineCount] = useState(INITIAL_VISIBLE_TIMELINE_ITEMS)
-  const prevStatusRef = useRef(agentStatus)
-  const stickRef = useRef(autoScroll)
-  const initialScrollPendingRef = useRef(initialScrollToBottom)
-  // Track whether the user is actively scrolling (mouse/touch/wheel interaction).
-  // While true we suppress ALL programmatic scroll-to-bottom so the user can
-  // freely browse history without being yanked back down.
-  const userScrollingRef = useRef(false)
-  const userScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const programmaticScrollRef = useRef(false)
-  const programmaticScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const initialMode: ViewportMode = scrollPolicy === 'follow' ? 'following' : 'browsing'
+  const [viewportMode, setViewportMode] = useState<ViewportMode>(initialMode)
+  const [unseenCount, setUnseenCount] = useState(0)
+  const [atStrictBottom, setAtStrictBottom] = useState(false)
+  const modeRef = useRef<ViewportMode>(initialMode)
+  const policyRef = useRef<MessageScrollPolicy>(scrollPolicy)
+  const initialScrollPendingRef = useRef(scrollPolicy !== 'manual')
+  const atBottomRef = useRef(false)
+  const anchorRef = useRef<ViewportAnchor | null>(null)
   const lastScrollTopRef = useRef(0)
-  // Track the last message count we auto-scrolled for, so we only scroll when
-  // genuinely new messages arrive — not on virtualizer re-measurement or other
-  // derived-value changes.
-  const lastAutoScrollCountRef = useRef(0)
-  const contentSpacerRef = useRef<HTMLDivElement>(null)
-  const pendingScrollFrameRef = useRef<number | null>(null)
-  const pendingSecondScrollFrameRef = useRef<number | null>(null)
-  const pendingScrollMarkReadRef = useRef(false)
-  const pendingScrollForceRef = useRef(false)
-
-  /* ── Detect user-initiated scroll vs programmatic scroll ──── *
-   * We listen for wheel / pointerdown on the scroll container.  *
-   * When detected we set userScrollingRef = true and keep it    *
-   * true for 1.5 s after the last interaction.  This prevents   *
-   * the virtualizer's internal re-measurement (which fires the  *
-   * onScroll handler) from falsely re-enabling stick-to-bottom. */
-  useEffect(() => {
-    const el = listRef.current
-    if (!el) return
-    lastScrollTopRef.current = el.scrollTop
-    const markUserScrolling = () => {
-      userScrollingRef.current = true
-      if (userScrollTimerRef.current) clearTimeout(userScrollTimerRef.current)
-      userScrollTimerRef.current = setTimeout(() => {
-        userScrollingRef.current = false
-      }, 1500)
-    }
-    const handleWheel = (event: WheelEvent) => {
-      markUserScrolling()
-      if (event.deltaY < 0 && el.scrollTop > 0) {
-        stickRef.current = false
-      } else if (isNearScrollBottom(el)) {
-        stickRef.current = autoScroll
-      }
-    }
-    el.addEventListener('wheel', handleWheel, { passive: true })
-    el.addEventListener('pointerdown', markUserScrolling)
-    el.addEventListener('touchstart', markUserScrolling, { passive: true })
-    return () => {
-      el.removeEventListener('wheel', handleWheel)
-      el.removeEventListener('pointerdown', markUserScrolling)
-      el.removeEventListener('touchstart', markUserScrolling)
-      if (userScrollTimerRef.current) clearTimeout(userScrollTimerRef.current)
-    }
-  }, [autoScroll])
-
-  useEffect(() => {
-    return () => {
-      if (programmaticScrollTimerRef.current) clearTimeout(programmaticScrollTimerRef.current)
-    }
-  }, [])
-
-  /* ── Smart auto-scroll + mark-read ────────────────────────── *
-   * Only update stickRef when the user is NOT actively scrolling *
-   * via wheel/pointer.  This prevents virtualizer re-measurement *
-   * from falsely flipping stickRef back to true.                 */
-  const handleScroll = useCallback(() => {
-    const el = listRef.current
-    if (!el) return
-    const previousScrollTop = lastScrollTopRef.current
-    const nextScrollTop = el.scrollTop
-    lastScrollTopRef.current = nextScrollTop
-    const atBottom = isNearScrollBottom(el)
-    // Only update stick state from genuine user scroll, not from
-    // programmatic scrolls or virtualizer re-measurement.
-    if (programmaticScrollRef.current) {
-      if (atBottom) onMarkRead?.()
-      return
-    }
-    if (shouldReleaseStickToBottomOnScroll({
-      previousScrollTop,
-      nextScrollTop,
-      atBottom,
-      userScrolling: userScrollingRef.current,
-      programmaticScroll: false,
-    })) {
-      stickRef.current = false
-      return
-    }
-    if (userScrollingRef.current) {
-      stickRef.current = atBottom
-      if (atBottom) onMarkRead?.()
-      return
-    }
-    if (atBottom) {
-      stickRef.current = autoScroll
-      onMarkRead?.()
-    }
-  }, [autoScroll, onMarkRead])
+  const userGestureRef = useRef(false)
+  const userIntentRef = useRef<'none' | 'up' | 'down'>('none')
+  const touchYRef = useRef<number | null>(null)
+  const detachedTailTimestampRef = useRef(0)
+  const knownPersistentKeysRef = useRef<Set<string>>(new Set())
+  const lastMarkedReadKeyRef = useRef<string | null>(null)
+  const latestPersistentReadKeyRef = useRef<string | null>(null)
+  const onMarkReadRef = useRef(onMarkRead)
+  const latestTimelineTimestampRef = useRef(0)
+  const logicalContentRevisionRef = useRef(0)
+  const previousTimelineTokensRef = useRef<TimelineItemSemanticToken[] | null>(null)
+  const initialBottomLayoutRef = useRef<{ active: boolean; revision: number }>({ active: false, revision: 0 })
+  const hasRenderableContentRef = useRef(false)
+  const historyRequestRef = useRef<{ scope: string; startKey: string; beforeIndex: number } | null>(null)
+  const anchorRestorePendingRef = useRef(false)
+  const pendingFocusKeyRef = useRef<string | null>(null)
+  const viewportSizeRef = useRef<{ width: number; height: number } | null>(null)
+  const previousTimelineKeysRef = useRef<string[]>([])
+  const messageKeyAssignmentsRef = useRef<{
+    scope: string
+    assignments: Map<string, Map<string, string>>
+  }>({ scope: scrollScope, assignments: new Map() })
+  const resultKeyOwnerRef = useRef<{ scope: string; owners: Map<string, string> }>({
+    scope: scrollScope,
+    owners: new Map(),
+  })
+  const streamedTurnKeysRef = useRef<{ scope: string; keys: Set<string> }>({
+    scope: scrollScope,
+    keys: new Set(),
+  })
+  onMarkReadRef.current = onMarkRead
 
   const workItemLogLen = workItemLog?.length ?? 0
   const workItemCount = workItemLogLen + (childSessions?.length ?? 0)
   const filteredMessages = useMemo(() => {
-    const visibleMessages = messages.filter(message => messageVisibleInDetailMode(message, detailMode))
+    const visibleMessages = messages.filter(message => isMessageVisibleAtDetailLevel(message, detailMode))
     if (!isCompanyRuntime) return visibleMessages
     return visibleMessages.filter((message) => {
       const isCompanySystemMessage = message.metadata?.type === 'system' && message.content.startsWith('[Company:')
       if (isCompanySystemMessage) return false
-      if (!showRuntimeProgress && message.content.startsWith('[Company:')) {
-        return false
-      }
+      if (!showRuntimeProgress && message.content.startsWith('[Company:')) return false
       return true
     })
   }, [detailMode, isCompanyRuntime, messages, showRuntimeProgress])
-  const floatPendingCheckpoints = viewKind === 'session' && !!onSend
+
   const checkpointAnalysis = useMemo(
     () => analyzeCheckpointMessages(filteredMessages),
     [filteredMessages],
   )
   const pendingCheckpointMessages = useMemo(
-    () => floatPendingCheckpoints
+    () => viewKind === 'session' && !!onSend
       ? filteredMessages.filter(message => checkpointAnalysis.pendingMessageIds.has(message.id))
       : [],
-    [checkpointAnalysis.pendingMessageIds, filteredMessages, floatPendingCheckpoints],
+    [checkpointAnalysis.pendingMessageIds, filteredMessages, onSend, viewKind],
   )
-  const timelineMessages = useMemo(
-    () => floatPendingCheckpoints
-      ? filteredMessages.filter(message => !checkpointAnalysis.pendingMessageIds.has(message.id))
-      : filteredMessages,
-    [checkpointAnalysis.pendingMessageIds, filteredMessages, floatPendingCheckpoints],
-  )
+  // Checkpoint cards never leave the chronological transcript. Their pending
+  // state only controls the fixed reminder rendered outside the scroll flow.
+  const timelineMessages = filteredMessages
+
   const thinkingProgressTurnIds = useMemo(() => {
     const ids = new Set<string>()
     for (const entry of progressLog ?? []) {
@@ -1305,7 +1258,7 @@ export const MessageList = React.memo(function MessageList({
     for (const message of timelineMessages) {
       const thinking = String(message.metadata?.runtime_thinking ?? '').trim()
       if (!thinking) continue
-      const turnId = String(message.metadata?.canonical_turn_id ?? message.metadata?.turn_id ?? '').trim()
+      const turnId = resolveCanonicalTurnId(message.metadata)
       if (turnId && thinkingProgressTurnIds.has(turnId)) continue
       entries.push({
         type: 'thinking' as const,
@@ -1339,66 +1292,203 @@ export const MessageList = React.memo(function MessageList({
     () => !showRuntimeProgress
       ? []
       : detailMode === 'full'
-      ? (progressLog ?? [])
-      : inlineProgressEntries,
+        ? (progressLog ?? [])
+        : inlineProgressEntries,
     [detailMode, inlineProgressEntries, progressLog, showRuntimeProgress],
   )
-  const bottomProgressEntries = useMemo(
-    () => secondaryProgressEntries,
-    [secondaryProgressEntries],
-  )
-  const draftTimelineItem = useMemo(() => {
+  const bottomProgressEntries = secondaryProgressEntries
+  const committedTurnIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const message of timelineMessages) {
+      const turnId = terminalAssistantTurnId(message)
+      if (turnId) ids.add(turnId)
+    }
+    return ids
+  }, [timelineMessages])
+  const draftTimelineItem = useMemo<TimelineItem | null>(() => {
     const text = String(draftAssistantText ?? '').trim()
-    if (!text) return null
+    const turnId = String(draftTurnId ?? '').trim()
+    if (!text || (turnId && committedTurnIds.has(turnId))) return null
     return {
-      kind: 'draft' as const,
-      id: `draft-${draftTurnId ?? draftIteration ?? 'active'}`,
-      timestamp: draftUpdatedAt ?? Date.now(),
+      kind: 'draft',
+      id: turnId ? `turn:assistant:${turnId}` : 'draft:active',
+      timestamp: draftUpdatedAt ?? timelineMessages[timelineMessages.length - 1]?.timestamp ?? 0,
       text,
       iteration: draftIteration,
       sortOrder: Number.MAX_SAFE_INTEGER,
     }
-  }, [draftAssistantText, draftIteration, draftTurnId, draftUpdatedAt])
+  }, [committedTurnIds, draftAssistantText, draftIteration, draftTurnId, draftUpdatedAt, timelineMessages])
+  useLayoutEffect(() => {
+    if (streamedTurnKeysRef.current.scope !== scrollScope) {
+      streamedTurnKeysRef.current = { scope: scrollScope, keys: new Set() }
+    }
+    if (draftTimelineItem) streamedTurnKeysRef.current.keys.add(draftTimelineItem.id)
+  }, [draftTimelineItem, scrollScope])
   const isAgentWorking = !!agentStatus && agentStatus !== 'idle'
   const hasProgressLog = bottomProgressEntries.length > 0
   const showProgressBlock = showRuntimeProgress && detailMode !== 'full' && (isAgentWorking || hasProgressLog)
-  const timelineItems = useMemo<TimelineItem[]>(() => {
-    const merged: TimelineItem[] = [
+  const timelineBuild = useMemo(() => {
+    const committed: TimelineItem[] = [
       ...buildNarrativeMessageItems(timelineMessages, { isCompanyRuntime, detailMode }),
       ...timelineProgressEntries.map((entry, idx) => ({
         kind: 'progress' as const,
-        id: `progress-${progressEntryKey(entry, idx)}`,
+        id: `progress:${progressEntryKey(entry)}`,
         timestamp: entry.timestamp,
         entry,
         sortOrder: idx * 2,
       })),
-    ]
-    if (draftTimelineItem) merged.push(draftTimelineItem)
-    return merged.sort((a, b) => a.timestamp - b.timestamp || a.sortOrder - b.sortOrder)
-  }, [detailMode, draftTimelineItem, isCompanyRuntime, timelineMessages, timelineProgressEntries])
-  const hiddenTimelineCount = Math.max(0, timelineItems.length - visibleTimelineCount)
-  const visibleTimelineItems = useMemo(
-    () => (hiddenTimelineCount > 0 ? timelineItems.slice(-visibleTimelineCount) : timelineItems),
-    [hiddenTimelineCount, timelineItems, visibleTimelineCount],
+    ].sort((a, b) => a.timestamp - b.timestamp || a.sortOrder - b.sortOrder)
+    const previousResultOwners = resultKeyOwnerRef.current.scope === scrollScope
+      ? resultKeyOwnerRef.current.owners
+      : new Map<string, string>()
+    const nextResultOwners = new Map<string, string>()
+    committed.forEach((item, index) => {
+      if (item.kind !== 'message') return
+      const resultKey = resultSurfaceDedupeKey(item.msg)
+      if (!resultKey) return
+      const owner = previousResultOwners.get(resultKey) ?? item.id
+      nextResultOwners.set(resultKey, owner)
+      if (owner !== item.id) committed[index] = { ...item, id: owner }
+    })
+    const duplicateKeyGroups = new Map<string, Array<{ index: number; identity: string }>>()
+    committed.forEach((item, index) => {
+      if (item.kind !== 'message') return
+      const identity = `${item.msg.channelId}\u0000${item.msg.id}`
+      const group = duplicateKeyGroups.get(item.id) ?? []
+      group.push({ index, identity })
+      duplicateKeyGroups.set(item.id, group)
+    })
+    const previousAssignments = messageKeyAssignmentsRef.current.scope === scrollScope
+      ? messageKeyAssignmentsRef.current.assignments
+      : new Map<string, Map<string, string>>()
+    const nextAssignments = new Map<string, Map<string, string>>()
+    for (const [baseKey, group] of duplicateKeyGroups) {
+      const previous = previousAssignments.get(baseKey)
+      const assigned = new Map<string, string>()
+      const usedKeys = new Set<string>()
+      // Preserve every mounted identity first, even if an older row was just
+      // inserted ahead of it or the former base-key owner disappeared.
+      for (const entry of group) {
+        const previousKey = previous?.get(entry.identity)
+        if (!previousKey || usedKeys.has(previousKey)) continue
+        assigned.set(entry.identity, previousKey)
+        usedKeys.add(previousKey)
+      }
+      for (const entry of group) {
+        if (assigned.has(entry.identity)) continue
+        const assignedKey = usedKeys.has(baseKey)
+          ? `${baseKey}:message:${encodeURIComponent(entry.identity)}`
+          : baseKey
+        assigned.set(entry.identity, assignedKey)
+        usedKeys.add(assignedKey)
+      }
+      nextAssignments.set(baseKey, assigned)
+      for (const entry of group) {
+        const assignedKey = assigned.get(entry.identity)
+        if (!assignedKey || assignedKey === baseKey) continue
+        const item = committed[entry.index]
+        if (item.kind !== 'message') continue
+        committed[entry.index] = {
+          ...item,
+          id: assignedKey,
+        }
+      }
+    }
+    // A live turn is one stable tail slot. Its updatedAt never re-sorts it.
+    if (draftTimelineItem) committed.push(draftTimelineItem)
+    return { items: committed, messageKeyAssignments: nextAssignments, resultKeyOwners: nextResultOwners }
+  }, [detailMode, draftTimelineItem, isCompanyRuntime, scrollScope, timelineMessages, timelineProgressEntries])
+  const timelineItems = timelineBuild.items
+  const timelineSemanticTokens = useMemo(
+    () => timelineItems.map(timelineItemSemanticToken),
+    [timelineItems],
+  )
+  useLayoutEffect(() => {
+    messageKeyAssignmentsRef.current = {
+      scope: scrollScope,
+      assignments: timelineBuild.messageKeyAssignments,
+    }
+    resultKeyOwnerRef.current = { scope: scrollScope, owners: timelineBuild.resultKeyOwners }
+  }, [scrollScope, timelineBuild.messageKeyAssignments, timelineBuild.resultKeyOwners])
+  const timelineMessagesRef = useRef(timelineMessages)
+  timelineMessagesRef.current = timelineMessages
+  latestTimelineTimestampRef.current = timelineMessages.reduce(
+    (latest, message) => Math.max(latest, message.timestamp),
+    0,
   )
 
-  useEffect(() => {
-    setVisibleTimelineCount(INITIAL_VISIBLE_TIMELINE_ITEMS)
-  }, [channelName, viewKind])
+  const [windowState, setWindowState] = useState<TimelineWindowState>({ scope: scrollScope, startKey: null })
+  const configuredStartKey = windowState.scope === scrollScope ? windowState.startKey : null
+  const defaultStartIndex = Math.max(0, timelineItems.length - INITIAL_VISIBLE_TIMELINE_ITEMS)
+  const configuredStartIndex = configuredStartKey
+    ? timelineItems.findIndex(item => item.id === configuredStartKey)
+    : -1
+  let recoveredStartIndex = -1
+  if (configuredStartKey && configuredStartIndex < 0) {
+    const previousKeys = previousTimelineKeysRef.current
+    const previousStartIndex = previousKeys.indexOf(configuredStartKey)
+    const currentKeyIndexes = new Map(timelineItems.map((item, index) => [item.id, index]))
+    for (let index = Math.max(0, previousStartIndex); index < previousKeys.length; index += 1) {
+      const currentIndex = currentKeyIndexes.get(previousKeys[index])
+      if (currentIndex !== undefined) {
+        recoveredStartIndex = currentIndex
+        break
+      }
+    }
+    if (recoveredStartIndex < 0) {
+      for (let index = previousStartIndex - 1; index >= 0; index -= 1) {
+        const currentIndex = currentKeyIndexes.get(previousKeys[index])
+        if (currentIndex !== undefined) {
+          recoveredStartIndex = currentIndex
+          break
+        }
+      }
+    }
+  }
+  const visibleStartIndex = configuredStartIndex >= 0
+    ? configuredStartIndex
+    : recoveredStartIndex >= 0
+      ? recoveredStartIndex
+      : defaultStartIndex
+  const visibleTimelineItems = useMemo(
+    () => timelineItems.slice(visibleStartIndex),
+    [timelineItems, visibleStartIndex],
+  )
+  const hiddenTimelineCount = visibleStartIndex
+  const timelineItemsRef = useRef(timelineItems)
+  timelineItemsRef.current = timelineItems
 
-  useEffect(() => {
-    stickRef.current = autoScroll
-    initialScrollPendingRef.current = initialScrollToBottom
-  }, [channelName, viewKind, autoScroll, initialScrollToBottom])
+  useLayoutEffect(() => {
+    const startKey = timelineItems[visibleStartIndex]?.id ?? null
+    if (windowState.scope === scrollScope && windowState.startKey === startKey) return
+    if (windowState.scope === scrollScope && windowState.startKey) {
+      anchorRestorePendingRef.current = true
+    }
+    setWindowState({ scope: scrollScope, startKey })
+  }, [scrollScope, timelineItems, visibleStartIndex, windowState.scope, windowState.startKey])
 
-  /* ── Pre-process: filter, dates + grouping ──────────────────── */
+  useLayoutEffect(() => {
+    const request = historyRequestRef.current
+    if (!request || request.scope !== scrollScope) return
+    const currentIndex = timelineItems.findIndex(item => item.id === request.startKey)
+    if (currentIndex <= request.beforeIndex) return
+    const nextIndex = Math.max(0, currentIndex - VISIBLE_TIMELINE_STEP)
+    historyRequestRef.current = null
+    anchorRestorePendingRef.current = true
+    setWindowState({ scope: scrollScope, startKey: timelineItems[nextIndex]?.id ?? null })
+  }, [scrollScope, timelineItems])
+
+  useLayoutEffect(() => {
+    previousTimelineKeysRef.current = timelineItems.map(item => item.id)
+  }, [timelineItems])
+
+  /* ── Pre-process dates + sender grouping ───────────────────────── */
   const processed = useMemo(() => {
     let lastDate = ''
     return visibleTimelineItems.map((item, idx) => {
       const dateStr = new Date(item.timestamp).toLocaleDateString()
       const showDate = dateStr !== lastDate
       if (showDate) lastDate = dateStr
-
       const prev = idx > 0 ? visibleTimelineItems[idx - 1] : null
       const isGrouped = item.kind === 'message'
         && prev?.kind === 'message'
@@ -1410,10 +1500,387 @@ export const MessageList = React.memo(function MessageList({
         && !(item.msg.metadata as any)?.is_work_item_event
         && !(prev.msg.metadata as any)?.is_work_item_event
         && item.msg.timestamp - prev.msg.timestamp < GROUP_WINDOW
-
       return { item, showDate, dateStr, isGrouped }
     })
   }, [visibleTimelineItems])
+
+  const hasWorkItemRuntimeCard = !!(
+    detailMode !== 'full'
+    && showWorkItemRuntimeCard
+    && isCompanyRuntime
+    && workItemCount > 0
+  )
+  const hasRenderableContent = timelineItems.length > 0 || hasWorkItemRuntimeCard || showProgressBlock
+  hasRenderableContentRef.current = hasRenderableContent
+
+  const findTimelineElement = useCallback((key: string): HTMLElement | null => {
+    const rows = contentRef.current?.querySelectorAll<HTMLElement>('[data-timeline-key]')
+    if (!rows) return null
+    for (const row of rows) {
+      if (row.dataset.timelineKey === key) return row
+    }
+    return null
+  }, [])
+
+  const updateAtBottom = useCallback((next: boolean) => {
+    atBottomRef.current = next
+    setAtStrictBottom(previous => previous === next ? previous : next)
+  }, [])
+
+  const markLatestRead = useCallback(() => {
+    const key = latestPersistentReadKeyRef.current
+    const markRead = onMarkReadRef.current
+    if (!key || !markRead || lastMarkedReadKeyRef.current === key) return
+    lastMarkedReadKeyRef.current = key
+    markRead()
+  }, [])
+
+  const captureViewportAnchor = useCallback(() => {
+    const list = listRef.current
+    const content = contentRef.current
+    if (!list || !content) return
+    const listRect = list.getBoundingClientRect()
+    const rows = content.querySelectorAll<HTMLElement>('[data-timeline-key]')
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect()
+      if (rect.bottom <= listRect.top + 0.5) continue
+      anchorRef.current = {
+        key: row.dataset.timelineKey ?? '',
+        viewportOffset: rect.top - listRect.top,
+      }
+      return
+    }
+    anchorRef.current = null
+  }, [])
+
+  const restoreViewportAnchor = useCallback(() => {
+    const list = listRef.current
+    const anchor = anchorRef.current
+    if (!list || !anchor?.key) return
+    const row = findTimelineElement(anchor.key)
+    if (!row) {
+      captureViewportAnchor()
+      return
+    }
+    const delta = (
+      row.getBoundingClientRect().top - list.getBoundingClientRect().top
+    ) - anchor.viewportOffset
+    if (Math.abs(delta) > 0.5) list.scrollTop += delta
+    anchor.viewportOffset = row.getBoundingClientRect().top - list.getBoundingClientRect().top
+    lastScrollTopRef.current = list.scrollTop
+    updateAtBottom(isNearScrollBottom(list))
+  }, [captureViewportAnchor, findTimelineElement, updateAtBottom])
+
+  const setMode = useCallback((next: ViewportMode) => {
+    modeRef.current = next
+    setViewportMode(previous => previous === next ? previous : next)
+  }, [])
+
+  const enterBrowsing = useCallback(() => {
+    initialBottomLayoutRef.current.active = false
+    if (modeRef.current !== 'browsing') {
+      detachedTailTimestampRef.current = latestTimelineTimestampRef.current
+      setUnseenCount(0)
+      setMode('browsing')
+    }
+    captureViewportAnchor()
+  }, [captureViewportAnchor, setMode])
+
+  const writeBottom = useCallback(() => {
+    const list = listRef.current
+    if (!list) return
+    const target = Math.max(0, list.scrollHeight - list.clientHeight)
+    if (Math.abs(list.scrollTop - target) > 0.5) list.scrollTop = target
+    lastScrollTopRef.current = list.scrollTop
+    updateAtBottom(isNearScrollBottom(list))
+  }, [updateAtBottom])
+
+  const resumeFollowing = useCallback(() => {
+    if (policyRef.current !== 'follow') return
+    setMode('following')
+    setUnseenCount(0)
+    anchorRef.current = null
+    writeBottom()
+    markLatestRead()
+  }, [markLatestRead, setMode, writeBottom])
+
+  const reachLatestFromUser = useCallback(() => {
+    if (policyRef.current === 'follow') {
+      resumeFollowing()
+      return
+    }
+    initialBottomLayoutRef.current.active = false
+    writeBottom()
+    captureViewportAnchor()
+    setUnseenCount(0)
+    markLatestRead()
+  }, [captureViewportAnchor, markLatestRead, resumeFollowing, writeBottom])
+
+  const reconcileViewport = useCallback(() => {
+    const list = listRef.current
+    if (!list || !hasRenderableContentRef.current) return
+    updateAtBottom(isNearScrollBottom(list))
+    if (initialScrollPendingRef.current) {
+      initialScrollPendingRef.current = false
+      if (policyRef.current === 'initial-bottom') {
+        initialBottomLayoutRef.current = {
+          active: true,
+          revision: logicalContentRevisionRef.current,
+        }
+      }
+      writeBottom()
+      if (policyRef.current !== 'follow') {
+        setMode('browsing')
+      }
+      return
+    }
+    const initialBottomLayout = initialBottomLayoutRef.current
+    if (
+      policyRef.current === 'initial-bottom'
+      && initialBottomLayout.active
+      && initialBottomLayout.revision === logicalContentRevisionRef.current
+    ) {
+      writeBottom()
+      return
+    }
+    if (policyRef.current === 'follow' && modeRef.current === 'following') {
+      writeBottom()
+      return
+    }
+    if (anchorRestorePendingRef.current) {
+      anchorRestorePendingRef.current = false
+      restoreViewportAnchor()
+    }
+  }, [restoreViewportAnchor, setMode, updateAtBottom, writeBottom])
+
+  useLayoutEffect(() => {
+    policyRef.current = scrollPolicy
+    const nextMode: ViewportMode = scrollPolicy === 'follow' ? 'following' : 'browsing'
+    modeRef.current = nextMode
+    setViewportMode(nextMode)
+    initialScrollPendingRef.current = scrollPolicy !== 'manual'
+    updateAtBottom(false)
+    anchorRef.current = null
+    historyRequestRef.current = null
+    anchorRestorePendingRef.current = false
+    pendingFocusKeyRef.current = null
+    viewportSizeRef.current = null
+    initialBottomLayoutRef.current = { active: false, revision: logicalContentRevisionRef.current }
+    knownPersistentKeysRef.current = new Set(
+      timelineMessagesRef.current.filter(isDurableTimelineMessage).map(messageTimelineKey),
+    )
+    detachedTailTimestampRef.current = latestTimelineTimestampRef.current
+    lastMarkedReadKeyRef.current = null
+    setUnseenCount(0)
+  }, [scrollPolicy, scrollScope, updateAtBottom])
+
+  useLayoutEffect(() => {
+    const previous = previousTimelineTokensRef.current
+    const unchanged = semanticTokenArraysEqual(previous, timelineSemanticTokens)
+    if (unchanged) return
+    previousTimelineTokensRef.current = timelineSemanticTokens
+    logicalContentRevisionRef.current += 1
+    const initialBottomLayout = initialBottomLayoutRef.current
+    if (!initialBottomLayout.active || initialBottomLayout.revision === logicalContentRevisionRef.current) return
+    initialBottomLayout.active = false
+    captureViewportAnchor()
+  }, [captureViewportAnchor, timelineSemanticTokens])
+
+  useLayoutEffect(() => {
+    const list = listRef.current
+    const content = contentRef.current
+    if (!list || !content) return
+    viewportSizeRef.current = { width: list.clientWidth, height: list.clientHeight }
+    reconcileViewport()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver((entries) => {
+      const viewportEntry = entries.find(entry => entry.target === list)
+      if (viewportEntry) {
+        const previous = viewportSizeRef.current
+        const next = { width: list.clientWidth, height: list.clientHeight }
+        if (previous && (previous.width !== next.width || previous.height !== next.height)) {
+          anchorRestorePendingRef.current = modeRef.current === 'browsing'
+        }
+        viewportSizeRef.current = next
+      }
+      reconcileViewport()
+    })
+    observer.observe(list)
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [reconcileViewport, scrollPolicy, scrollScope])
+
+  useEffect(() => {
+    const list = listRef.current
+    if (!list) return
+    lastScrollTopRef.current = list.scrollTop
+
+    const handleWheel = (event: WheelEvent) => {
+      userIntentRef.current = event.deltaY < 0 ? 'up' : event.deltaY > 0 ? 'down' : 'none'
+      if (event.deltaY < 0 && list.scrollTop > 0) enterBrowsing()
+      if (event.deltaY > 0 && isNearScrollBottom(list)) resumeFollowing()
+    }
+    const handlePointerDown = () => {
+      // Overlay scrollbars report no physical gutter. Treat any pointer-held
+      // scroll inside the viewport as explicit user control; ordinary clicks
+      // clear this flag on pointerup without changing the viewport mode.
+      userGestureRef.current = true
+    }
+    const finishPointerGesture = () => {
+      userGestureRef.current = false
+      userIntentRef.current = 'none'
+      if (modeRef.current === 'browsing') captureViewportAnchor()
+    }
+    const handleTouchStart = (event: TouchEvent) => {
+      touchYRef.current = event.touches[0]?.clientY ?? null
+      userGestureRef.current = true
+    }
+    const handleTouchMove = (event: TouchEvent) => {
+      const nextY = event.touches[0]?.clientY
+      const previousY = touchYRef.current
+      if (nextY === undefined || previousY === null) return
+      if (nextY > previousY + 1) {
+        userIntentRef.current = 'up'
+        enterBrowsing()
+      } else if (nextY < previousY - 1) {
+        userIntentRef.current = 'down'
+      }
+      touchYRef.current = nextY
+    }
+    const handleTouchEnd = () => {
+      touchYRef.current = null
+      finishPointerGesture()
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (target && target !== list && (
+        target.isContentEditable
+        || ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(target.tagName)
+      )) return
+      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) || (event.key === ' ' && event.shiftKey)) {
+        userIntentRef.current = 'up'
+        enterBrowsing()
+      } else if (['ArrowDown', 'PageDown', 'End'].includes(event.key) || event.key === ' ') {
+        userIntentRef.current = 'down'
+        if (event.key === 'End') reachLatestFromUser()
+      }
+    }
+    const handleKeyUp = () => {
+      userIntentRef.current = 'none'
+    }
+    const handleScroll = () => {
+      const previous = lastScrollTopRef.current
+      const next = list.scrollTop
+      const atBottom = isNearScrollBottom(list)
+      const wasAtBottom = atBottomRef.current
+      const userDriven = userGestureRef.current || userIntentRef.current !== 'none'
+      // A native scrollbar thumb drag does not consistently dispatch its
+      // pointerdown to the scroll element (overlay scrollbars in particular).
+      // FOLLOWING never writes upward, so an observed upward scroll away from
+      // the strict bottom is itself sufficient user intent without a timer.
+      if (next < previous - 0.5 && !atBottom) {
+        enterBrowsing()
+      } else if (userDriven) {
+        if (userIntentRef.current === 'up') {
+          enterBrowsing()
+        } else if (atBottom && (next > previous + 0.5 || userIntentRef.current === 'down')) {
+          resumeFollowing()
+        }
+        if (modeRef.current === 'browsing') captureViewportAnchor()
+        if (!userGestureRef.current) userIntentRef.current = 'none'
+      } else if (next > previous + 0.5 && atBottom) {
+        // Symmetric fallback for a native scrollbar drag to the strict tail.
+        // Controller writes update lastScrollTopRef before their scroll event,
+        // so they cannot take this branch.
+        resumeFollowing()
+      } else if (modeRef.current === 'browsing' && Math.abs(next - previous) > 0.5) {
+        // Native/assistive scrolling does not always expose a wheel, key, or
+        // pointer marker. Any non-controller movement while browsing becomes
+        // the new viewport anchor before a later resize or history prepend.
+        captureViewportAnchor()
+      }
+      lastScrollTopRef.current = next
+      updateAtBottom(atBottom)
+      if (
+        !wasAtBottom
+        && atBottom
+        && (userDriven || next > previous + 0.5)
+      ) {
+        markLatestRead()
+      }
+    }
+
+    list.addEventListener('wheel', handleWheel, { passive: true })
+    list.addEventListener('pointerdown', handlePointerDown)
+    window.addEventListener('pointerup', finishPointerGesture)
+    window.addEventListener('pointercancel', finishPointerGesture)
+    window.addEventListener('blur', finishPointerGesture)
+    list.addEventListener('touchstart', handleTouchStart, { passive: true })
+    list.addEventListener('touchmove', handleTouchMove, { passive: true })
+    list.addEventListener('touchend', handleTouchEnd, { passive: true })
+    list.addEventListener('touchcancel', handleTouchEnd, { passive: true })
+    list.addEventListener('keydown', handleKeyDown)
+    list.addEventListener('keyup', handleKeyUp)
+    list.addEventListener('scroll', handleScroll, { passive: true })
+    return () => {
+      list.removeEventListener('wheel', handleWheel)
+      list.removeEventListener('pointerdown', handlePointerDown)
+      window.removeEventListener('pointerup', finishPointerGesture)
+      window.removeEventListener('pointercancel', finishPointerGesture)
+      window.removeEventListener('blur', finishPointerGesture)
+      list.removeEventListener('touchstart', handleTouchStart)
+      list.removeEventListener('touchmove', handleTouchMove)
+      list.removeEventListener('touchend', handleTouchEnd)
+      list.removeEventListener('touchcancel', handleTouchEnd)
+      list.removeEventListener('keydown', handleKeyDown)
+      list.removeEventListener('keyup', handleKeyUp)
+      list.removeEventListener('scroll', handleScroll)
+    }
+  }, [captureViewportAnchor, enterBrowsing, markLatestRead, reachLatestFromUser, resumeFollowing, updateAtBottom])
+
+  const durableTimelineMessages = useMemo(
+    () => timelineMessages.filter(isDurableTimelineMessage),
+    [timelineMessages],
+  )
+  const persistentMessageKeys = useMemo(
+    () => durableTimelineMessages.map(messageTimelineKey),
+    [durableTimelineMessages],
+  )
+  useEffect(() => {
+    const current = new Set(persistentMessageKeys)
+    if (knownPersistentKeysRef.current.size === 0) {
+      knownPersistentKeysRef.current = current
+      return
+    }
+    if (modeRef.current === 'browsing') {
+      let added = 0
+      for (const message of durableTimelineMessages) {
+        const key = messageTimelineKey(message)
+        if (!knownPersistentKeysRef.current.has(key) && message.timestamp >= detachedTailTimestampRef.current) added += 1
+      }
+      if (added > 0) setUnseenCount(previous => previous + added)
+    } else {
+      setUnseenCount(0)
+    }
+    knownPersistentKeysRef.current = current
+  }, [durableTimelineMessages, persistentMessageKeys])
+
+  const latestPersistentMessage = durableTimelineMessages.reduce<ChatMessage | undefined>(
+    (latest, message) => !latest || message.timestamp > latest.timestamp ? message : latest,
+    undefined,
+  )
+  const latestPersistentReadKey = latestPersistentMessage
+    ? `${messageTimelineKey(latestPersistentMessage)}:${latestPersistentMessage.timestamp}`
+    : null
+  latestPersistentReadKeyRef.current = latestPersistentReadKey
+  useEffect(() => {
+    if (!latestPersistentReadKey) return
+    const list = listRef.current
+    const atBottom = !!list && isNearScrollBottom(list)
+    updateAtBottom(atBottom)
+    if (modeRef.current !== 'following' && !atBottom) return
+    markLatestRead()
+  }, [latestPersistentReadKey, markLatestRead, updateAtBottom, viewportMode])
 
   const copyMsg = useCallback((id: string, content: string) => {
     void copyTextToClipboard(content).then((copied) => {
@@ -1424,439 +1891,96 @@ export const MessageList = React.memo(function MessageList({
   }, [])
 
   const handleLoadOlder = useCallback(async () => {
-    if (hiddenTimelineCount > 0) {
-      setVisibleTimelineCount((prev) => Math.min(timelineItems.length, prev + VISIBLE_TIMELINE_STEP))
+    captureViewportAnchor()
+    anchorRestorePendingRef.current = true
+    if (visibleStartIndex > 0) {
+      const nextIndex = Math.max(0, visibleStartIndex - VISIBLE_TIMELINE_STEP)
+      setWindowState({ scope: scrollScope, startKey: timelineItems[nextIndex]?.id ?? null })
       return
     }
     if (!hasOlderHistory || loadingOlderHistory || !onLoadOlderHistory) return
+    historyRequestRef.current = configuredStartKey
+      ? { scope: scrollScope, startKey: configuredStartKey, beforeIndex: visibleStartIndex }
+      : null
     await onLoadOlderHistory(filteredMessages[0])
-    setVisibleTimelineCount((prev) => prev + VISIBLE_TIMELINE_STEP)
   }, [
+    captureViewportAnchor,
+    configuredStartKey,
     filteredMessages,
     hasOlderHistory,
-    hiddenTimelineCount,
     loadingOlderHistory,
     onLoadOlderHistory,
-    timelineItems.length,
-  ])
-
-  const welcome = WELCOME[viewKind]
-
-  /* ── Build the flat list of renderable items for the virtualizer ──── *
-   * We append work-item card, progress block, and pending checkpoints as
-   * extra "virtual items" at the end so they participate in the same
-   * virtualised scroll container and don't force a separate DOM tree.   */
-  const hasWorkItemRuntimeCard = !!(
-    detailMode !== 'full'
-    && showWorkItemRuntimeCard
-    && isCompanyRuntime
-    && workItemCount > 0
-  )
-  const hasPendingCheckpoints = pendingCheckpointMessages.length > 0
-
-  type VirtualItem =
-    | { kind: 'history-hint' }
-    | { kind: 'timeline'; idx: number }
-    | { kind: 'work-item-runtime-card' }
-    | { kind: 'progress-block' }
-    | { kind: 'pending-section' }
-    | { kind: 'end-anchor' }
-
-  const virtualItems = useMemo<VirtualItem[]>(() => {
-    const items: VirtualItem[] = []
-    if (hiddenTimelineCount > 0 || hasOlderHistory) items.push({ kind: 'history-hint' })
-    for (let i = 0; i < processed.length; i++) items.push({ kind: 'timeline', idx: i })
-    if (hasWorkItemRuntimeCard) items.push({ kind: 'work-item-runtime-card' })
-    if (showProgressBlock) items.push({ kind: 'progress-block' })
-    if (hasPendingCheckpoints) items.push({ kind: 'pending-section' })
-    items.push({ kind: 'end-anchor' })
-    return items
-  }, [processed.length, hiddenTimelineCount, hasOlderHistory, hasWorkItemRuntimeCard, showProgressBlock, hasPendingCheckpoints])
-
-  /* ── Virtualizer: only mount DOM nodes for visible rows ──────────── */
-  const virtualizer = useVirtualizer({
-    count: virtualItems.length,
-    getScrollElement: () => listRef.current,
-    estimateSize: (index) => {
-      const item = virtualItems[index]
-      if (item.kind === 'end-anchor') return 1
-      if (item.kind === 'history-hint') return 48
-      if (item.kind === 'work-item-runtime-card') return 120
-      if (item.kind === 'progress-block') return 80
-      if (item.kind === 'pending-section') return 200
-      // Timeline items: estimate based on content length for better initial layout
-      const p = processed[item.idx]
-      if (p?.item.kind === 'message') {
-        const len = p.item.msg.content.length
-        if (len < 100) return 72
-        if (len < 500) return 120
-        if (len < 2000) return 200
-        return 300 // Long messages (will be collapsed anyway)
-      }
-      if (p?.item.kind === 'draft') {
-        const len = p.item.text.length
-        return len < 400 ? 120 : 200
-      }
-      if (p?.item.kind === 'ops-bundle') {
-        return p.item.events.length > 8 ? 92 : 48
-      }
-      return 80
-    },
-    overscan: 15, // Render 15 extra items above/below viewport
-    getItemKey: (index) => {
-      const item = virtualItems[index]
-      if (item.kind === 'timeline') return processed[item.idx]?.item.id ?? `tl-${item.idx}`
-      return item.kind
-    },
-  })
-
-  /* ── Auto-scroll to bottom via virtualizer ───────────────────────── */
-  const virtualizerRef = useRef(virtualizer)
-  virtualizerRef.current = virtualizer
-  const virtualItemsLenRef = useRef(virtualItems.length)
-  virtualItemsLenRef.current = virtualItems.length
-
-  const markProgrammaticScroll = useCallback(() => {
-    programmaticScrollRef.current = true
-    if (programmaticScrollTimerRef.current) clearTimeout(programmaticScrollTimerRef.current)
-    programmaticScrollTimerRef.current = setTimeout(() => {
-      programmaticScrollRef.current = false
-    }, PROGRAMMATIC_SCROLL_GRACE_MS)
-  }, [])
-
-  const cancelScheduledScroll = useCallback(() => {
-    if (pendingScrollFrameRef.current !== null) {
-      window.cancelAnimationFrame(pendingScrollFrameRef.current)
-      pendingScrollFrameRef.current = null
-    }
-    if (pendingSecondScrollFrameRef.current !== null) {
-      window.cancelAnimationFrame(pendingSecondScrollFrameRef.current)
-      pendingSecondScrollFrameRef.current = null
-    }
-    pendingScrollMarkReadRef.current = false
-    pendingScrollForceRef.current = false
-  }, [])
-
-  const scrollToEnd = useCallback(() => {
-    const len = virtualItemsLenRef.current
-    markProgrammaticScroll()
-    if (len > 0) {
-      virtualizerRef.current.scrollToIndex(len - 1, { align: 'end' })
-    }
-    const el = listRef.current
-    if (el) {
-      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
-      lastScrollTopRef.current = el.scrollTop
-    }
-  }, [markProgrammaticScroll])
-
-  const scheduleScrollToEnd = useCallback((markRead = false, force = false) => {
-    pendingScrollMarkReadRef.current ||= markRead
-    pendingScrollForceRef.current ||= force
-    if (pendingScrollFrameRef.current !== null || pendingSecondScrollFrameRef.current !== null) return
-
-    pendingScrollFrameRef.current = window.requestAnimationFrame(() => {
-      pendingScrollFrameRef.current = null
-      if (!pendingScrollForceRef.current && (!stickRef.current || userScrollingRef.current)) {
-        pendingScrollMarkReadRef.current = false
-        pendingScrollForceRef.current = false
-        return
-      }
-      scrollToEnd()
-      pendingSecondScrollFrameRef.current = window.requestAnimationFrame(() => {
-        pendingSecondScrollFrameRef.current = null
-        const shouldMarkRead = pendingScrollMarkReadRef.current
-        const shouldForce = pendingScrollForceRef.current
-        pendingScrollMarkReadRef.current = false
-        pendingScrollForceRef.current = false
-        if (!shouldForce && (!stickRef.current || userScrollingRef.current)) return
-        scrollToEnd()
-        if (shouldMarkRead) onMarkRead?.()
-      })
-    })
-  }, [onMarkRead, scrollToEnd])
-
-  useEffect(() => cancelScheduledScroll, [cancelScheduledScroll])
-
-  useEffect(() => {
-    if (!autoScroll || typeof ResizeObserver === 'undefined') return
-    const el = contentSpacerRef.current
-    if (!el) return
-    const observer = new ResizeObserver(() => {
-      if (initialScrollPendingRef.current || !stickRef.current) return
-      scheduleScrollToEnd(false)
-    })
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [autoScroll, scheduleScrollToEnd, virtualItems.length])
-
-  // Stable message count — only changes when actual messages arrive, not on
-  // virtualizer re-measurement or other derived-value changes.
-  const messageCount = timelineMessages.length
-
-  const tailFollowKey = useMemo(() => {
-    const tail = timelineItems[timelineItems.length - 1]
-    const tailKey = tail?.kind === 'message'
-      ? `message:${tail.id}:${tail.msg.content.length}:${tail.timestamp}`
-      : tail?.kind === 'draft'
-      ? `draft:${tail.id}:${tail.text.length}:${tail.timestamp}`
-      : tail?.kind === 'progress'
-      ? `progress:${tail.id}:${tail.entry.summary.length}:${tail.entry.detail?.length ?? 0}:${tail.timestamp}`
-      : tail?.kind === 'ops-bundle'
-      ? `ops:${tail.id}:${tail.events.length}:${tail.timestamp}`
-      : 'empty'
-    const bottomTail = bottomProgressEntries[bottomProgressEntries.length - 1]
-    const bottomProgressKey = bottomTail
-      ? `${bottomTail.type}:${bottomTail.summary.length}:${bottomTail.detail?.length ?? 0}:${bottomTail.timestamp}`
-      : 'none'
-    return [
-      virtualItems.length,
-      messageCount,
-      tailKey,
-      bottomProgressEntries.length,
-      bottomProgressKey,
-      pendingCheckpointMessages.length,
-      workItemCount,
-      showProgressBlock ? `${agentStatus ?? ''}:${currentTool ?? ''}` : '',
-    ].join('|')
-  }, [
-    agentStatus,
-    bottomProgressEntries,
-    currentTool,
-    messageCount,
-    pendingCheckpointMessages.length,
-    showProgressBlock,
+    scrollScope,
     timelineItems,
-    virtualItems.length,
-    workItemCount,
+    visibleStartIndex,
   ])
 
-  useLayoutEffect(() => {
-    const hasRenderableContent =
-      timelineItems.length > 0
-      || pendingCheckpointMessages.length > 0
-      || workItemCount > 0
-      || showProgressBlock
+  const jumpToLatest = reachLatestFromUser
 
-    if (!initialScrollPendingRef.current || !hasRenderableContent) return
-    initialScrollPendingRef.current = false
-    lastAutoScrollCountRef.current = messageCount
-    scheduleScrollToEnd(autoScroll, true)
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally only on initial content
-  }, [timelineItems.length > 0, showProgressBlock])
-
-  // Auto-scroll when NEW messages arrive — only if user hasn't scrolled away.
-  // We compare messageCount to lastAutoScrollCountRef to avoid firing on
-  // virtualizer re-measurement or other derived-value changes.
-  useEffect(() => {
-    if (!autoScroll || initialScrollPendingRef.current) return
-    if (!stickRef.current) return
-    if (messageCount <= lastAutoScrollCountRef.current) return
-    lastAutoScrollCountRef.current = messageCount
-    scheduleScrollToEnd(true)
-  }, [messageCount, autoScroll, scheduleScrollToEnd])
-
-  // Auto-scroll when agent status transitions to active (starts working)
-  useEffect(() => {
-    const statusBecameActive = prevStatusRef.current === 'idle' && !!agentStatus && agentStatus !== 'idle'
-    prevStatusRef.current = agentStatus
-    if (!autoScroll || initialScrollPendingRef.current || !stickRef.current || !statusBecameActive) return
-    scheduleScrollToEnd(true)
-  }, [agentStatus, autoScroll, scheduleScrollToEnd])
-
-  useEffect(() => {
-    if (!autoScroll || initialScrollPendingRef.current || !stickRef.current) return
-    if (!draftTimelineItem) return
-    scheduleScrollToEnd(true)
-  }, [autoScroll, draftTimelineItem, scheduleScrollToEnd])
+  const centerTimelineRow = useCallback((key: string): boolean => {
+    const list = listRef.current
+    const row = findTimelineElement(key)
+    if (!list || !row) return false
+    const listRect = list.getBoundingClientRect()
+    const rowRect = row.getBoundingClientRect()
+    list.scrollTop += rowRect.top - listRect.top - Math.max(0, (list.clientHeight - rowRect.height) / 2)
+    lastScrollTopRef.current = list.scrollTop
+    updateAtBottom(isNearScrollBottom(list))
+    captureViewportAnchor()
+    return true
+  }, [captureViewportAnchor, findTimelineElement, updateAtBottom])
 
   useLayoutEffect(() => {
-    if (!autoScroll || initialScrollPendingRef.current || !stickRef.current) return
-    scheduleScrollToEnd(false)
-  }, [autoScroll, scheduleScrollToEnd, tailFollowKey])
+    const key = pendingFocusKeyRef.current
+    if (!key || !centerTimelineRow(key)) return
+    pendingFocusKeyRef.current = null
+  }, [centerTimelineRow, visibleTimelineItems])
 
-  /* ── Render a single virtual row ─────────────────────────────────── */
-  const renderVirtualRow = useCallback((vItem: VirtualItem) => {
-    if (vItem.kind === 'history-hint') {
-      return (
-        <div className="msg-history-hint">
-          <button
-            className="msg-history-load-btn"
-            onClick={() => { void handleLoadOlder() }}
-            disabled={loadingOlderHistory}
-          >
-            {loadingOlderHistory
-              ? 'Loading older messages...'
-              : hiddenTimelineCount > 0
-                ? `Load ${Math.min(VISIBLE_TIMELINE_STEP, hiddenTimelineCount)} older messages`
-                : 'Load older messages'}
-          </button>
-          <span className="msg-history-meta">
-            Showing latest {visibleTimelineItems.length} of {totalMessageCount ?? timelineItems.length}
-          </span>
-        </div>
-      )
-    }
+  const focusPendingCheckpoint = useCallback(() => {
+    const pending = pendingCheckpointMessages[0]
+    if (!pending) return
+    enterBrowsing()
+    anchorRestorePendingRef.current = false
+    const key = messageTimelineKey(pending)
+    if (centerTimelineRow(key)) return
+    const itemIndex = timelineItems.findIndex(item => item.id === key)
+    if (itemIndex < 0) return
+    pendingFocusKeyRef.current = key
+    const nextStartIndex = Math.max(0, itemIndex - 2)
+    setWindowState({ scope: scrollScope, startKey: timelineItems[nextStartIndex]?.id ?? key })
+  }, [centerTimelineRow, enterBrowsing, pendingCheckpointMessages, scrollScope, timelineItems])
 
-    if (vItem.kind === 'work-item-runtime-card') {
-      return (
-        <div className="msg-row agent">
-          <div className="msg-avatar agent-avatar"><IconSparkle /></div>
-          <div className="msg-body">
-            <WorkItemProgressCard
-              workItemLog={workItemLog ?? []}
-              roleWorkItems={roleWorkItems}
-              executorRoleWorkItems={executorRoleWorkItems}
-              childSessions={childSessions}
-              isCompanyRuntime={isCompanyRuntime}
-              onWorkItemClick={onWorkItemClick}
-            />
-          </div>
-        </div>
-      )
-    }
-
-    if (vItem.kind === 'progress-block') {
-      return (
-        <div className="msg-row agent agent-working-row">
-          <div className="msg-avatar agent-avatar"><IconSparkle /></div>
-          <div className="msg-body">
-            <AgentProgressBlock entries={bottomProgressEntries} agentStatus={agentStatus} currentTool={currentTool} toolElapsedMs={toolElapsedMs} lastToolSummary={lastToolSummary} expandedByDefault />
-          </div>
-        </div>
-      )
-    }
-
-    if (vItem.kind === 'pending-section') {
-      return (
-        <div className="msg-pending-section">
-          <div className="msg-pending-header">Pending Actions</div>
-          <div className="msg-pending-stack">
-            {pendingCheckpointMessages.map((msg) => {
-              const displayName = msg.senderDeleted ? '[Deleted]' : msg.senderName
-              const color = agentColor(msg.sender === 'system' ? (msg.senderName || 'OPC') : msg.sender)
-              const replyTaskId = msg.channelId.startsWith('session:')
-                ? msg.channelId.slice('session:'.length)
-                : (msg.metadata?.taskId ?? msg.metadata?.task_id)
-              const cpType = String(msg.metadata?.checkpoint_type ?? '').trim()
-              const cpReplyMeta = toCheckpointReplyMetadata(msg.metadata)
-
-              return (
-                <div key={`pending-${msg.id}`} className={`msg-row agent msg-row-pending${msg.senderDeleted ? ' deleted-sender' : ''}`}>
-                  <div className="msg-avatar agent-avatar" style={{ background: color }}>
-                    {displayName.charAt(0).toUpperCase()}
-                  </div>
-                  <div className="msg-body">
-                    <div className="msg-agent-header">
-                      <span className={`msg-sender${msg.senderDeleted ? ' deleted' : ''}`} style={{ color }}>{displayName}</span>
-                      <span className="msg-time" title={formatFullTime(msg.timestamp)}>{formatTime(msg.timestamp)}</span>
-                    </div>
-                    {cpType === 'company_recruitment_confirmation' && (
-                      <RecruitmentPanel
-                        meta={msg.metadata!}
-                        onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, extraMetadata)}
-                        responded={false}
-                      />
-                    )}
-                    {cpType === 'company_staffing_selection' && (
-                      <StaffingSelectionPanel
-                        meta={msg.metadata!}
-                        onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, extraMetadata)}
-                        responded={false}
-                      />
-                    )}
-                    {cpType === 'company_work_item_gate' && (
-                      <EscalationPanel meta={msg.metadata!} onReply={(text) => onSend?.(text, replyTaskId, cpReplyMeta)} responded={false} />
-                    )}
-                    {cpType === 'company_delivery_feedback' && (
-                      <DeliveryFeedbackPanel meta={msg.metadata!} onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, extraMetadata ?? cpReplyMeta)} responded={false} />
-                    )}
-                    {cpType === 'company_reorg_pending' && (
-                      <ReorgPanel meta={msg.metadata!} onReply={(text) => onSend?.(text, replyTaskId, cpReplyMeta)} responded={false} />
-                    )}
-                    {cpType === 'human_escalation' && (
-                      <EscalationPanel meta={msg.metadata!} onReply={(text) => onSend?.(text, replyTaskId, cpReplyMeta)} responded={false} />
-                    )}
-                    {cpType === 'task_user_input' && (
-                      <TaskUserInputPanel
-                        meta={msg.metadata!}
-                        onReply={(text, extraMetadata) => onSend?.(text, replyTaskId, { ...cpReplyMeta, ...extraMetadata } as CheckpointReplyMetadata)}
-                        responded={false}
-                      />
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )
-    }
-
-    if (vItem.kind === 'end-anchor') {
-      return <div className="msg-end-anchor" />
-    }
-
-    // Timeline item
-    const { item, showDate, dateStr, isGrouped } = processed[vItem.idx]
-
+  const renderProcessedRow = useCallback((row: typeof processed[number]) => {
+    const { item, showDate, dateStr, isGrouped } = row
     if (item.kind === 'progress') {
-      return (
-        <ProgressRow entry={item.entry} showDate={showDate} dateStr={dateStr} compact={detailMode !== 'full'} />
-      )
+      return <ProgressRow entry={item.entry} showDate={showDate} dateStr={dateStr} compact={detailMode !== 'full'} />
     }
-
     if (item.kind === 'draft') {
-      return (
-        <DraftRow
-          text={item.text}
-          timestamp={item.timestamp}
-          iteration={item.iteration}
-          showDate={showDate}
-          dateStr={dateStr}
-        />
-      )
+      return <DraftRow text={item.text} timestamp={item.timestamp} iteration={item.iteration} showDate={showDate} dateStr={dateStr} />
     }
-
     if (item.kind === 'ops-bundle') {
-      return (
-        <OpsBundleRow
-          events={item.events}
-          showDate={showDate}
-          dateStr={dateStr}
-        />
-      )
+      return <OpsBundleRow events={item.events} showDate={showDate} dateStr={dateStr} />
     }
 
     const { msg } = item
+    const keepExpanded = streamedTurnKeysRef.current.scope === scrollScope
+      && streamedTurnKeysRef.current.keys.has(item.id)
     const isSystem = msg.metadata?.type === 'system'
     const isExecutionContext = isExecutionContextMessage(msg)
-    const isWorkItemEvent = !!(msg.metadata as any)?.is_work_item_event || msg.content.startsWith('[Company:')
+    const isWorkItemEvent = !keepExpanded && (
+      !!(msg.metadata as any)?.is_work_item_event || msg.content.startsWith('[Company:')
+    )
     const hasCpPanel = isCheckpointCardMetadata(msg.metadata)
     const isUser = msg.sender === 'user'
-    const projectUpdate = !isUser && !hasCpPanel ? parseProjectUpdatePayload(msg.content) : null
-
-    if (isWorkItemEvent && !hasCpPanel) {
-      return <WorkItemRow msg={msg} showDate={showDate} dateStr={dateStr} />
-    }
+    const projectUpdate = !keepExpanded && !isUser && !hasCpPanel
+      ? parseProjectUpdatePayload(msg.content)
+      : null
+    if (isWorkItemEvent && !hasCpPanel) return <WorkItemRow msg={msg} showDate={showDate} dateStr={dateStr} />
     if (projectUpdate) {
-      return (
-        <ProjectUpdateRow
-          msg={msg}
-          payload={projectUpdate}
-          showDate={showDate}
-          dateStr={dateStr}
-          isCopied={copiedId === msg.id}
-          onCopy={copyMsg}
-        />
-      )
+      return <ProjectUpdateRow msg={msg} payload={projectUpdate} showDate={showDate} dateStr={dateStr} isCopied={copiedId === msg.id} onCopy={copyMsg} />
     }
-    if (isExecutionContext && !hasCpPanel) {
-      return <ContextRow msg={msg} showDate={showDate} dateStr={dateStr} />
-    }
-    if (isSystem && !hasCpPanel) {
-      return <SystemRow msg={msg} showDate={showDate} dateStr={dateStr} />
-    }
+    if (isExecutionContext && !hasCpPanel) return <ContextRow msg={msg} showDate={showDate} dateStr={dateStr} />
+    if (isSystem && !hasCpPanel) return <SystemRow msg={msg} showDate={showDate} dateStr={dateStr} />
     if (isUser) {
       return (
         <UserRow
@@ -1866,23 +1990,9 @@ export const MessageList = React.memo(function MessageList({
         />
       )
     }
-    // System-ops compaction: messages like "[Delegating to codex] ..." or
-    // "[External resume] codex restored prior session →…" become a one-line
-    // collapsed log row, with full content tucked behind a chevron. This
-    // keeps the conversation readable instead of dumping the raw command.
-    if (msg.sender === 'system') {
-      const checkpointType = String(msg.metadata?.checkpoint_type ?? '').trim()
-      if (!isCheckpointCardMetadata(msg.metadata)) {
-        const ops = classifySystemOps(msg.content)
-        if (ops) {
-          return (
-            <SystemOpsRow
-              msg={msg} showDate={showDate} dateStr={dateStr}
-              isGrouped={isGrouped} classification={ops}
-            />
-          )
-        }
-      }
+    if (msg.sender === 'system' && !isCheckpointCardMetadata(msg.metadata)) {
+      const ops = classifySystemOps(msg.content)
+      if (ops) return <SystemOpsRow msg={msg} showDate={showDate} dateStr={dateStr} isGrouped={isGrouped} classification={ops} />
     }
     return (
       <AgentRow
@@ -1890,80 +2000,95 @@ export const MessageList = React.memo(function MessageList({
         isCopied={copiedId === msg.id}
         isCheckpointResponded={checkpointAnalysis.respondedMessageIds.has(msg.id)}
         suppressCheckpointPanel={checkpointAnalysis.duplicateMessageIds.has(msg.id)}
+        keepExpanded={keepExpanded}
         onCopy={copyMsg} onSend={onSend}
       />
     )
-  }, [
-    processed, copiedId, copyMsg, renderUserMarkdown, checkpointAnalysis,
-    onSend, handleLoadOlder, loadingOlderHistory, hiddenTimelineCount,
-    visibleTimelineItems.length, totalMessageCount, timelineItems.length,
-    workItemLog, roleWorkItems, executorRoleWorkItems, childSessions, messages, onWorkItemClick, onWorkItemOpenSession, bottomProgressEntries,
-    agentStatus, currentTool, toolElapsedMs, lastToolSummary,
-    pendingCheckpointMessages, showProgressBlock, detailMode,
-  ])
+  }, [checkpointAnalysis, copiedId, copyMsg, detailMode, onSend, renderUserMarkdown, scrollScope])
 
-  if (timelineItems.length === 0 && pendingCheckpointMessages.length === 0) {
-    return (
-      <div className="msg-list" ref={listRef} onScroll={handleScroll}>
-        <div className="msg-welcome">
-          <div className="msg-welcome-icon">{welcome.icon}</div>
-          <div className="msg-welcome-title">{channelName || welcome.title}</div>
-          <div className="msg-welcome-hint">{welcome.hint}</div>
-        </div>
-        {hasWorkItemRuntimeCard && (
-          <div className="msg-row agent">
-            <div className="msg-avatar agent-avatar"><IconSparkle /></div>
-            <div className="msg-body">
-              <WorkItemProgressCard
-                workItemLog={workItemLog ?? []}
-                roleWorkItems={roleWorkItems}
-                executorRoleWorkItems={executorRoleWorkItems}
-                childSessions={childSessions}
-                isCompanyRuntime={isCompanyRuntime}
-                onWorkItemClick={onWorkItemClick}
-              />
-            </div>
-          </div>
-        )}
-        {showProgressBlock && (
-          <div className="msg-row agent">
-            <div className="msg-avatar agent-avatar"><IconSparkle /></div>
-            <div className="msg-body">
-              <AgentProgressBlock entries={bottomProgressEntries} agentStatus={agentStatus} currentTool={currentTool} toolElapsedMs={toolElapsedMs} lastToolSummary={lastToolSummary} expandedByDefault />
-            </div>
-          </div>
-        )}
-        <div className="msg-end-anchor" />
-      </div>
-    )
-  }
-
-  const virtualRows = virtualizer.getVirtualItems()
+  const welcome = WELCOME[viewKind]
 
   return (
-    <div className="msg-list" ref={listRef} onScroll={handleScroll}>
-      {/* Spacer before visible items — pushes content down to correct scroll position */}
-      <div ref={contentSpacerRef} style={{ height: virtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
-        <div
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            width: '100%',
-            transform: `translateY(${virtualRows[0]?.start ?? 0}px)`,
-          }}
-        >
-          {virtualRows.map((virtualRow) => (
-            <div
-              key={virtualRow.key}
-              data-index={virtualRow.index}
-              ref={virtualizer.measureElement}
-            >
-              {renderVirtualRow(virtualItems[virtualRow.index])}
+    <div className={`msg-list-shell msg-list-shell-${viewportMode}`}>
+      <div
+        className={`msg-list msg-list-${viewportMode}`}
+        ref={listRef}
+        tabIndex={0}
+        data-scroll-policy={scrollPolicy}
+        data-viewport-mode={viewportMode}
+      >
+        <div className="msg-list-content" ref={contentRef}>
+          {!hasRenderableContent && (
+            <div className="msg-welcome">
+              <div className="msg-welcome-icon">{welcome.icon}</div>
+              <div className="msg-welcome-title">{channelName || welcome.title}</div>
+              <div className="msg-welcome-hint">{welcome.hint}</div>
+            </div>
+          )}
+
+          {(hiddenTimelineCount > 0 || hasOlderHistory) && (
+            <div className="msg-history-hint">
+              <button className="msg-history-load-btn" onClick={() => { void handleLoadOlder() }} disabled={loadingOlderHistory}>
+                {loadingOlderHistory
+                  ? 'Loading older messages...'
+                  : hiddenTimelineCount > 0
+                    ? `Load ${Math.min(VISIBLE_TIMELINE_STEP, hiddenTimelineCount)} older messages`
+                    : 'Load older messages'}
+              </button>
+              <span className="msg-history-meta">
+                Showing {visibleTimelineItems.length} of {totalMessageCount ?? timelineItems.length}
+              </span>
+            </div>
+          )}
+
+          {processed.map(row => (
+            <div key={row.item.id} className="msg-timeline-row" data-timeline-key={row.item.id}>
+              {renderProcessedRow(row)}
             </div>
           ))}
+
+          {hasWorkItemRuntimeCard && (
+            <div className="msg-row agent">
+              <div className="msg-avatar agent-avatar"><IconSparkle /></div>
+              <div className="msg-body">
+                <WorkItemProgressCard
+                  workItemLog={workItemLog ?? []}
+                  roleWorkItems={roleWorkItems}
+                  executorRoleWorkItems={executorRoleWorkItems}
+                  childSessions={childSessions}
+                  isCompanyRuntime={isCompanyRuntime}
+                  onWorkItemClick={onWorkItemClick}
+                />
+              </div>
+            </div>
+          )}
+
+          {showProgressBlock && (
+            <div className="msg-row agent agent-working-row">
+              <div className="msg-avatar agent-avatar"><IconSparkle /></div>
+              <div className="msg-body">
+                <AgentProgressBlock entries={bottomProgressEntries} agentStatus={agentStatus} currentTool={currentTool} toolElapsedMs={toolElapsedMs} lastToolSummary={lastToolSummary} expandedByDefault />
+              </div>
+            </div>
+          )}
+          <div className="msg-end-anchor" />
         </div>
       </div>
+
+      {(pendingCheckpointMessages.length > 0 || (viewportMode === 'browsing' && !atStrictBottom)) && (
+        <div className="msg-list-floating-actions">
+          {pendingCheckpointMessages.length > 0 && (
+            <button type="button" className="msg-list-float-btn msg-list-pending-btn" onClick={focusPendingCheckpoint}>
+              Pending actions · {pendingCheckpointMessages.length}
+            </button>
+          )}
+          {viewportMode === 'browsing' && !atStrictBottom && (
+            <button type="button" className="msg-list-float-btn msg-list-latest-btn" onClick={jumpToLatest}>
+              {unseenCount > 0 ? `${unseenCount} new · ` : ''}Back to latest
+            </button>
+          )}
+        </div>
+      )}
 
       {lightboxUrl && (
         <div className="lightbox-overlay" onClick={() => setLightboxUrl(null)}>

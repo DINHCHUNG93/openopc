@@ -81,4 +81,15 @@ const fallbackMarkup = renderToStaticMarkup(
 assert.match(fallbackMarkup, /CTO/)
 assert.doesNotMatch(fallbackMarkup, /Engineer/)
 
+const preparingMarkup = renderToStaticMarkup(
+  React.createElement(WorkItemProgressCard, {
+    workItemLog: [],
+    isCompanyRuntime: true,
+  }),
+)
+
+assert.match(preparingMarkup, /Execution Progress/)
+assert.match(preparingMarkup, /Preparing company roles/)
+assert.match(preparingMarkup, /role="status"/)
+
 console.log('WorkItemProgressCard.test.tsx: OK (executor rollup preferred with current-owner fallback)')

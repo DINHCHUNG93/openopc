@@ -1,26 +1,38 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useId, useMemo } from 'react'
 import type { Project } from '../types/kanban'
+import { useI18n } from '../i18n'
+import { toProjectSlug, type ProjectIdPolicy } from '../lib/projectIdPolicy'
 
 interface ProjectSelectorProps {
   projects: Project[]
   activeId: string
+  projectIdPolicy: ProjectIdPolicy | null
   onSelect: (id: string) => void
   onCreate: (id: string) => void
   onDelete?: (id: string) => void
 }
 
-export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
+export function ProjectSelector({ projects, activeId, projectIdPolicy, onSelect, onCreate, onDelete }: ProjectSelectorProps) {
+  const { t } = useI18n()
+  const validationMessageId = useId()
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
+  const newSlug = useMemo(() => toProjectSlug(newName), [newName])
+  const hasName = newName.trim().length > 0
+  const slugValid = projectIdPolicy?.matches(newSlug) ?? false
+  const nameInvalid = hasName && projectIdPolicy !== null && !slugValid
+  const validationMessage = hasName && !slugValid
+    ? t(projectIdPolicy ? 'project.nameInvalid' : 'project.policyUnavailable')
+    : null
+
   const handleCreate = useCallback(() => {
-    const id = newName.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '')
-    if (!id) return
-    onCreate(id)
+    if (!slugValid) return
+    onCreate(newSlug)
     setNewName('')
     setCreating(false)
-  }, [newName, onCreate])
+  }, [newSlug, onCreate, slugValid])
 
   const handleDelete = useCallback(() => {
     if (!confirmDelete || !onDelete) return
@@ -34,7 +46,8 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
         className="theme-select"
         value={activeId}
         onChange={e => onSelect(e.target.value)}
-        title="Switch project"
+        title={t('project.switch')}
+        aria-label={t('project.switch')}
       >
         {projects.map(p => (
           <option key={p.id} value={p.id}>{p.name}</option>
@@ -45,22 +58,45 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           onSubmit={e => { e.preventDefault(); handleCreate() }}
           style={{ display: 'flex', gap: 4 }}
         >
-          <input
-            autoFocus
-            className="theme-select"
-            value={newName}
-            placeholder="project-name"
-            onChange={e => setNewName(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
-            style={{ width: 120 }}
-          />
-          <button type="submit" className="pill-btn" style={{ fontSize: 11, padding: '2px 8px' }}>+</button>
+          <span style={{ position: 'relative', display: 'inline-flex' }}>
+            <input
+              autoFocus
+              className="theme-select"
+              value={newName}
+              placeholder={t('project.placeholder')}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Escape') setCreating(false) }}
+              aria-invalid={nameInvalid || undefined}
+              aria-describedby={validationMessage ? validationMessageId : undefined}
+              title={validationMessage ?? undefined}
+              style={{ width: 120 }}
+            />
+            {validationMessage && (
+              <span
+                id={validationMessageId}
+                className="project-name-validation"
+                role="status"
+                aria-live="polite"
+              >
+                {validationMessage}
+              </span>
+            )}
+          </span>
+          <button
+            type="submit"
+            className="pill-btn"
+            disabled={!slugValid}
+            aria-label={t('project.create')}
+            title={t('project.create')}
+            style={{ fontSize: 11, padding: '2px 8px', opacity: slugValid ? 1 : 0.5 }}
+          >+</button>
         </form>
       ) : (
         <button
           className="pill-btn"
           onClick={() => setCreating(true)}
-          title="New project"
+          title={t('project.new')}
+          aria-label={t('project.new')}
           style={{ fontSize: 11, padding: '2px 8px' }}
         >
           +
@@ -70,10 +106,10 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
         <button
           className="pill-btn"
           onClick={() => setConfirmDelete(activeId)}
-          title="Delete project"
+          title={t('project.delete')}
           style={{ fontSize: 11, padding: '2px 8px', color: '#ef4444' }}
         >
-          Del
+          {t('project.deleteButton')}
         </button>
       )}
 
@@ -84,14 +120,15 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
           background: 'rgba(0,0,0,0.5)',
         }}>
           <div style={{
-            background: 'var(--bg-surface, #1e1e2e)', borderRadius: 12, padding: '24px 32px',
+            background: 'var(--bg-elevated)', borderRadius: 12, padding: '24px 32px',
+            border: '1px solid var(--border)', color: 'var(--text)',
             maxWidth: 400, boxShadow: '0 8px 32px rgba(0,0,0,0.4)', textAlign: 'center',
           }}>
-            <p style={{ margin: '0 0 8px', fontWeight: 600, fontSize: 15 }}>
-              Delete project "{confirmDelete}"?
+            <p style={{ margin: '0 0 8px', fontWeight: 600, fontSize: 15, color: 'var(--text)' }}>
+              {t('project.confirmTitle', { name: confirmDelete })}
             </p>
-            <p style={{ margin: '0 0 20px', fontSize: 13, opacity: 0.7 }}>
-              All sessions, messages, tasks, and agent data in this project will be permanently deleted. This action cannot be undone.
+            <p style={{ margin: '0 0 20px', fontSize: 13, color: 'var(--text-secondary)' }}>
+              {t('project.confirmBody')}
             </p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
               <button
@@ -99,14 +136,14 @@ export function ProjectSelector({ projects, activeId, onSelect, onCreate, onDele
                 onClick={() => setConfirmDelete(null)}
                 style={{ padding: '6px 18px', fontSize: 13 }}
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 className="pill-btn"
                 onClick={handleDelete}
                 style={{ padding: '6px 18px', fontSize: 13, background: '#ef4444', color: '#fff' }}
               >
-                Delete
+                {t('common.delete')}
               </button>
             </div>
           </div>
